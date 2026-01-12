@@ -82,8 +82,9 @@ class FlashChunkPrefillSoftmaxEpilogue<CausalMask_, LocalMask_, epilogue::IntelX
   //
 
   static constexpr Params to_underlying_arguments(Arguments const& args) {
-    constexpr double kLog2e = 1.4426950408889634074;  // log_2(e) = M_LOG2E
-    Element val = args.scale * static_cast<Element>(kLog2e);
+    constexpr double kLog2e = 1;  // log_2(e) = M_LOG2E
+    // Element val = args.scale * static_cast<Element>(kLog2e);
+    Element val = static_cast<Element>(kLog2e);
     return Params{val};
   }
 
@@ -122,11 +123,11 @@ class FlashChunkPrefillSoftmaxEpilogue<CausalMask_, LocalMask_, epilogue::IntelX
             // continue;
           } else {
             Element eq = frag_s(base_indx) - max_scale_bcast;
-            frag_s(base_indx) = sycl::native::exp2(eq);
+            frag_s(base_indx) = sycl::native::exp(eq);
           }
         } else {
           Element eq = frag_s(base_indx) - max_scale_bcast;
-          frag_s(base_indx) = sycl::native::exp2(eq);
+          frag_s(base_indx) = sycl::native::exp(eq);
         }
         sum(index) += frag_s(base_indx);
       }
@@ -171,10 +172,10 @@ class FlashChunkPrefillSoftmaxEpilogue<CausalMask_, LocalMask_, epilogue::IntelX
         if ((std::isinf(max_scale) && max_scale < 0) || (std::isinf(max_prev) && max_prev < 0)) {
           exp_scale = 0.f;
         } else {
-          exp_scale = sycl::native::exp2(max_prev * params.scale - max_scale);
+          exp_scale = sycl::native::exp(max_prev * params.scale - max_scale);
         }
       } else {
-        exp_scale = sycl::native::exp2(max_prev * params.scale - max_scale);
+        exp_scale = sycl::native::exp(max_prev * params.scale - max_scale);
       }
 
       CUTLASS_PRAGMA_UNROLL
@@ -192,11 +193,11 @@ class FlashChunkPrefillSoftmaxEpilogue<CausalMask_, LocalMask_, epilogue::IntelX
               // continue;
             } else {
               Element eq = frag_s(base_indx) - max_scale_bcast;
-              frag_s(base_indx) = sycl::native::exp2(eq);
+              frag_s(base_indx) = sycl::native::exp(eq);
             }
           } else {
             Element eq = frag_s(base_indx) - max_scale_bcast;
-            frag_s(base_indx) = sycl::native::exp2(eq);
+            frag_s(base_indx) = sycl::native::exp(eq);
           }
           sum(index) += frag_s(base_indx);
         }

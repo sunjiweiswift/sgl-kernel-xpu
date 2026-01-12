@@ -447,6 +447,9 @@ class FMHAPrefillChunk {
         // head_size_qk, batch* num_heads_q / group_head_q), which can be merged
         // into one gemm for (int i = 0; i < q_group_size; ++i) {
         collective_mma.mmaQK(tSr, gQ, gK_, tSr, ceil_div(head_size_qk, QK_BLK_K), mainloop_params);
+        for (int i = 0; i < size(tSr); i++) {
+          tSr[i] = tSr[i] * (ElementAccumulator)(1.0f / sycl::sqrt((float)head_size_qk));
+        }
 
         if constexpr (LocalMask) {
           // Sliding windows
@@ -467,6 +470,7 @@ class FMHAPrefillChunk {
                 bool right_mask =
                     col_idx > cute::min(seq_len_kv_cache, row + row_idx + col_ref + mainloop_params.window_right);
                 if (left_mask || right_mask) {
+                  // tSr(row, m, n) = ElementAccumulator{0};
                   tSr(row, m, n) = ElementAccumulator{-INFINITY};
                 }
               }
@@ -485,6 +489,7 @@ class FMHAPrefillChunk {
                 for (int m = 0; m < FragsM; m++) {  // 2
                   CUTLASS_PRAGMA_UNROLL
                   for (int row = 0; row < Vec; row++) {  // 8
+                    // tSr(row, m, n) = ElementAccumulator{0};
                     tSr(row, m, n) = ElementAccumulator{-INFINITY};
                   }
                 }
@@ -503,6 +508,8 @@ class FMHAPrefillChunk {
                     CUTLASS_PRAGMA_UNROLL
                     for (int row = 0; row < Vec; row++) {  // 8
                       int row_idx = row_start + m * Vec + row;
+                      if (row_idx + seq_diff < col_idx) 
+                      // tSr(row, m, n) = ElementAccumulator{0};
                       if (row_idx + seq_diff < col_idx) tSr(row, m, n) = ElementAccumulator{-INFINITY};
                     }
                   }
@@ -514,6 +521,10 @@ class FMHAPrefillChunk {
         auto& tiled_prefetch_v_ = tiled_prefetch_v_cache;
         auto& pVgV_ = pVgV_cache;
         int v_prefetch_idx = cached_nblock;
+        // if (thread(0, 15)) {
+        //   print("\n tSr \n");
+        //   print_tensor(tSr);
+        // }
         for (int i = 0; i < size<1>(pVgV_); i++) {
           prefetch(tiled_prefetch_v_, pVgV_(_, i, _, v_prefetch_idx));
         }
