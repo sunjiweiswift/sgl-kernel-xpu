@@ -190,9 +190,16 @@ class XeFMHAFwdKernel {
       //     batch);
 
       int seq_len_q =
-          problem_shape.seq_len_qo.cumulative_length[batch + 1] - problem_shape.seq_len_qo.cumulative_length[batch];
+          (problem_shape.seq_len_qo.cumulative_length[batch + 1] - problem_shape.seq_len_qo.cumulative_length[batch]) *
+          problem_shape.seq_len_qo.q_group_size;
       int seq_len_k_new = 0;
       int seq_len_k_cache = problem_shape.seq_len_kv_cache.cumulative_length[batch];
+      if (thread(0, 0)) {
+        print(
+            "seq_len_q %d problem_shape.seq_len_qo.q_group_size %d \n",
+            seq_len_q,
+            problem_shape.seq_len_qo.q_group_size);
+      }
       return cute::make_tuple<int, int, int>(seq_len_q, seq_len_k_new, seq_len_k_cache);
 
     } else {
@@ -209,6 +216,19 @@ class XeFMHAFwdKernel {
     auto& p = params.kernel;
     ProblemShape const& s = p.shape;
     int head_group_q = s.num_heads_q / s.num_heads_kv;
+    if (thread(0, 0)) {
+      print(
+          "operator batch: %d num_heads_q: %d num_heads_kv: %d seq_len_qo: %d seq_len_kv: %d seq_len_kv_cache: %d head_size_qk: %d head_size_vo: "
+          "%d \n",
+          s.batch,
+          s.num_heads_q,
+          s.num_heads_kv,
+          (int)s.seq_len_qo,
+          (int)s.seq_len_kv,
+          (int)s.seq_len_kv_cache,
+          s.head_size_qk,
+          s.head_size_vo);
+    }
 
     int thr_id = int(ThreadIdxX());
     int sub_group_id = thr_id / intel::sg_size;
@@ -247,10 +267,10 @@ class XeFMHAFwdKernel {
       if constexpr (is_var_len) {
         auto qo_cumulative = s.seq_len_qo.cumulative_length;
         auto kv_cumulative = s.seq_len_kv.cumulative_length;
-        offset_q = s.num_heads_q * s.head_size_qk * qo_cumulative[idx_b];
+        offset_q = s.num_heads_q * s.head_size_qk * qo_cumulative[idx_b] * s.seq_len_qo.q_group_size;
         // offset_k = s.num_heads_kv * s.head_size_qk * kv_cumulative[idx_b];
         // offset_v = s.num_heads_kv * s.head_size_vo * kv_cumulative[idx_b];
-        offset_o = s.num_heads_q * s.head_size_vo * qo_cumulative[idx_b];
+        offset_o = s.num_heads_q * s.head_size_vo * qo_cumulative[idx_b] * s.seq_len_qo.q_group_size;
         if (s.seq_len_kv_cache.cumulative_length) {
           auto kv_cumulative_cache = s.seq_len_kv_cache.cumulative_length;
           // offset_k_cache = s.num_heads_kv * s.head_size_qk * kv_cumulative_cache[idx_b];
@@ -263,7 +283,10 @@ class XeFMHAFwdKernel {
       auto shape_K = make_shape(s.seq_len_kv_cache.total_length, s.head_size_qk, s.num_heads_kv, batch_dim);
       auto shape_V = make_shape(s.head_size_vo, s.seq_len_kv_cache.total_length, s.num_heads_kv, batch_dim);
       auto shape_O = make_shape(seq_len_qo, s.head_size_vo, s.num_heads_q, batch_dim);
-
+      if (thread(0,0)) {
+        print("shape_Q: "); print(shape_Q); print("\n");
+        print("shape_O: "); print(shape_O); print("\n");
+      }
       auto dcQ = const_cast<ElementQ*>(p.Q + offset_q);
       auto dcK_cache = const_cast<ElementK*>(p.K_cache + offset_k_cache);
       auto dcV_cache = const_cast<ElementV*>(p.V_cache + offset_v_cache);

@@ -59,6 +59,16 @@ struct XeFHMAIndividualTileScheduler {
         size(ceil_div(shape.head_size_vo, get<1>(tile_shape))),  // V
         size(ceil_div(shape.seq_len_qo, get<0>(tile_shape))),    // Q
         size(shape.batch * shape.num_heads_q));                  // (h,b) -- split later
+
+    print(
+        " XeFHMAIndividualTileScheduler : shape.head_size_vo%d , shape.seq_len_qo%d , shape.batch%d  tile_shape0%d, tile_shape1%d, "
+        "shape.num_heads_q%d ",
+        shape.head_size_vo,
+        (int)shape.seq_len_qo,
+        shape.batch,
+        (int)get<0>(tile_shape),
+        (int)get<1>(tile_shape),
+        shape.num_heads_q);
     return Params{grid, {shape.num_heads_q}};
   }
 

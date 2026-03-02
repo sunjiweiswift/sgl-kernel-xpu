@@ -145,6 +145,7 @@ def pad_input(hidden_states, indices, batch, seqlen):
     Return:
         hidden_states: (batch, seqlen, ...)
     """
+    import pdb;pdb.set_trace()
     dim = hidden_states.shape[1:]
     output = torch.zeros(
         (batch * seqlen), *dim, device=hidden_states.device, dtype=hidden_states.dtype
@@ -1000,8 +1001,6 @@ def test_flash_attn_kvcache(
                 assert (out - out_ref).abs().mean().item() <= mult_mean * (
                     out_pt - out_ref
                 ).abs().mean().item()
-
-
 @pytest.mark.skipif(
     not is_fa3_supported(),
     reason="flash_attn at sgl-kernel is only supported on sm90 and above",
@@ -1043,17 +1042,14 @@ def test_flash_attn_kvcache(
     ),
 )
 # @pytest.mark.parametrize("rotary_fraction", [0.0])
-@pytest.mark.parametrize("page_size", [128])
-# @pytest.mark.parametrize("page_size", [64, 128])
-# @pytest.mark.parametrize("page_size", [None])
+@pytest.mark.parametrize("page_size", [ 128])
 # @pytest.mark.parametrize("has_leftpad", [False, True])
 @pytest.mark.parametrize("has_leftpad", [False])
 # @pytest.mark.parametrize("has_batch_idx", [False, True])
 @pytest.mark.parametrize("has_batch_idx", [False])
 # @pytest.mark.parametrize("varlen_q", [False, True])
 @pytest.mark.parametrize("varlen_q", [True])
-@pytest.mark.parametrize("d", [64])
-# @pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [ 128])
 @pytest.mark.parametrize("seqlen_q", [1])
 @pytest.mark.parametrize(
     "seqlen_k",
@@ -1094,8 +1090,6 @@ def test_flash_attn_decode_kvcache(
     mha_type,
     dtype,
 ):
-    from sgl_kernel.flash_attn import flash_attn_decode_with_kvcache
-
     if page_size is not None and seqlen_k % page_size != 0:
         pytest.skip()
     if seqlen_q > seqlen_k and new_kv:
@@ -1418,7 +1412,9 @@ def test_flash_attn_decode_kvcache(
                 else:
                     k_cache_paged.copy_(k_cache_saved)
                     v_cache_paged.copy_(v_cache_saved)
-                out, lse, *rest = flash_attn_decode_with_kvcache(
+                from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+                out, lse, *rest = flash_attn_with_kvcache(
                     q if not varlen_q else q_unpad,
                     k_cache if page_size is None else k_cache_paged,
                     v_cache if page_size is None else v_cache_paged,
@@ -1444,6 +1440,10 @@ def test_flash_attn_decode_kvcache(
                     num_splits=num_splits,
                     return_softmax_lse=True,
                 )
+
+                import pdb
+
+                pdb.set_trace()
                 if varlen_q:
                     out = output_pad_fn(out)
                 # out = flash_attn_decode_with_kvcache(
@@ -1457,6 +1457,7 @@ def test_flash_attn_decode_kvcache(
                 # lse_ref = torch.logsumexp(qk / math.sqrt(d), -1)
                 # probs = torch.softmax(qk, dim=-1)
                 torch.xpu.synchronize()
+                import pdb;pdb.set_trace()
                 out = out.flatten()
                 out_ref = out_ref.flatten()
                 out_pt = out_pt.flatten()

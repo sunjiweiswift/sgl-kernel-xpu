@@ -43,6 +43,7 @@ struct VariableLength {
   int max_length;
   int total_length = 0;
   int* cumulative_length = nullptr;
+  int q_group_size = 1;
 
   CUTE_HOST_DEVICE operator int() const {
     return max_length;

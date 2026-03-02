@@ -1,0 +1,7 @@
+Using pip 25.3 from /home/sunjiwei/miniforge3/envs/sgl-xpu/lib/python3.10/site-packages/pip (python 3.10)
+Processing /home/sunjiwei/code/sgl-kernel-xpu
+  Installing build dependencies: started
+  Running command installing build dependencies
+  Using pip 25.3 from /home/sunjiwei/miniforge3/envs/sgl-xpu/lib/python3.10/site-packages/pip (python 3.10)
+  Installing build dependencies: finished with status 'canceled'
+ERROR: Operation cancelled by user

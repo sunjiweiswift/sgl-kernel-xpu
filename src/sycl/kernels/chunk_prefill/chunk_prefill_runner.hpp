@@ -1,66 +1,25 @@
-/***************************************************************************************************
- * Copyright (c) 2024 - 2025 Codeplay Software Ltd. All rights reserved.
- * Copyright (C) 2025 Intel Corporation, All rights reserved.
- * SPDX-License-Identifier: BSD-3-Clause
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- * list of conditions and the following disclaimer.
- *
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- * this list of conditions and the following disclaimer in the documentation
- * and/or other materials provided with the distribution.
- *
- * 3. Neither the name of the copyright holder nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- **************************************************************************************************/
-#pragma once
-
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
 #include <cute/tensor.hpp>
-#include <random>
-#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
-#include "Utils.h"
-#include "comm/common.h"
+#include "../../Utils.h"
+#include "../../comm/common.h"
+#include "../flash_attention/fmha_fusion.hpp"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
-#include "cutlass/gemm/device/gemm_universal_adapter.h"
-#include "cutlass/util/GPU_Clock.hpp"
-#include "cutlass/util/command_line.h"
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
-#include "cutlass/util/reference/device/gemm_complex.h"
-#include "cutlass/util/reference/device/tensor_compare.h"
 #include "cutlass/util/sycl_event_manager.hpp"
-#include "kernels/flash_attention/fmha_fusion.hpp"
-#include "kernels/flash_attention/xe_fhma_fwd_kernel.hpp"
-#include "kernels/flash_attention/xe_tile_scheduler.hpp"
-
-// #include "helper.h"
-// #include "sycl_common.hpp"
+#include "tile_scheduler_chunk_prefill.hpp"
+#include "xe_chunk_prefill.hpp"
+#include "xe_flash_attn_chunk_prefill_epilogue.hpp"
+#include "xe_flash_attn_chunk_prefill_softmax_epilogue.hpp"
 
 using namespace cute;
-
-struct Arguments {
+namespace chunkprefill {
+struct Flash_fwd_params {
   using index_t = int64_t;
 
   // The QKV matrices.
@@ -104,8 +63,8 @@ struct Arguments {
   int dv, dv_rounded;  // For the case where V headdim is different from Q/K headdim
 
   // The scaling factors for the kernel.
-  float softmax_scale;
-  void* softmax_sink_ptr;
+  float scale_softmax;
+  void* sink_softmax;
   float softcap;
 
   // array of length b+1 holding starting offset of each sequence.
@@ -185,43 +144,43 @@ struct Arguments {
 
   bool is_rotary_interleaved;
 
-  // int num_splits;  // For split-KV version
-  // bool pack_gqa;
+  int num_splits;  // For split-KV version
+  bool pack_gqa;
 
-  // int* __restrict__ tile_count_semaphore;
+  int* __restrict__ tile_count_semaphore;
   // int * __restrict__ num_m_blocks_ptr;
   // int * __restrict__ num_n_blocks_ptr;
-  // int* __restrict__ num_splits_dynamic_ptr;
-  // bool skip_scheduler_metadata_computation;
+  int* __restrict__ num_splits_dynamic_ptr;
+  bool skip_scheduler_metadata_computation;
 
   torch::TensorOptions tensor_opts;
 };
 
-template <typename Kernel>
-class KernelCur {};
-///////////////////////////////////////////////////////////////////////////////////////////////////
-// 3 input matrices: Keys, Queries and Values.
+// Flash Attention takes 3 input matrices: Keys, Queries and Values.
 using LayoutQ = cutlass::layout::RowMajor;
 using LayoutK = cutlass::layout::ColumnMajor;
 using LayoutV = cutlass::layout::RowMajor;
 using LayoutO = cutlass::layout::RowMajor;
 
-template <class FMHADecodeKernel, bool isVarLen = false>
-struct KernelRunner {
-  using StrideQ = typename FMHADecodeKernel::StrideQ;
-  using StrideK = typename FMHADecodeKernel::StrideK;
-  using StrideV = typename FMHADecodeKernel::StrideV;
-  using StrideO = typename FMHADecodeKernel::StrideO;
+template <class FMHAChunkPrefillKernel, bool isVarLen>
+struct ChunkPrefillRunner {
+  using StrideQ = typename FMHAChunkPrefillKernel::StrideQ;
+  using StrideK = typename FMHAChunkPrefillKernel::StrideK;
+  using StrideV = typename FMHAChunkPrefillKernel::StrideV;
+  using StrideO = typename FMHAChunkPrefillKernel::StrideO;
 
-  using ElementQ = typename FMHADecodeKernel::ElementQ;
-  using ElementK = typename FMHADecodeKernel::ElementK;
-  using ElementV = typename FMHADecodeKernel::ElementV;
-  using ElementO = typename FMHADecodeKernel::ElementO;
+  using ElementQ = typename FMHAChunkPrefillKernel::ElementQ;
+  using ElementK = typename FMHAChunkPrefillKernel::ElementK;
+  using ElementV = typename FMHAChunkPrefillKernel::ElementV;
+  using ElementAcc = typename FMHAChunkPrefillKernel::ElementAccumulator;
+  using ElementSink = typename FMHAChunkPrefillKernel::ElementSink;
 
-  using CollectiveMainloop = typename FMHADecodeKernel::CollectiveMainloop;
-  using ElementS = typename CollectiveMainloop::ElementS;
+  using CollectiveEpilogue = typename FMHAChunkPrefillKernel::CollectiveEpilogue;
+  using ElementOutput = typename CollectiveEpilogue::ElementOutput;
+  using ElementCompute = typename CollectiveEpilogue::ElementCompute;
+  using ElementAccumulator = typename CollectiveEpilogue::ElementAccumulator;
 
-  using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<isVarLen>;
+  using ProblemShapeType = typename FMHAChunkPrefillKernel::ProblemShape;
 
   //
   // Data members
@@ -235,36 +194,8 @@ struct KernelRunner {
   StrideV stride_V_cache;
   StrideO stride_O;
 
-  // cutlass::DeviceAllocation<ElementQ> block_Q;
-  // cutlass::DeviceAllocation<ElementK> block_K;
-  // cutlass::DeviceAllocation<ElementV> block_V;
-  // cutlass::DeviceAllocation<ElementK> block_K_cache;
-  // cutlass::DeviceAllocation<ElementV> block_V_cache;
-  // cutlass::DeviceAllocation<ElementO> block_O;
-  // cutlass::DeviceAllocation<ElementO> block_ref_O;
-
-  // std::vector<int> cumulative_seqlen_q;
-  // std::vector<int> cumulative_seqlen_kv;
-  // std::vector<int> cumulative_seqlen_kv_cache;
-  // cutlass::DeviceAllocation<int> device_cumulative_seqlen_q;
-  // cutlass::DeviceAllocation<int> device_cumulative_seqlen_kv;
-  // cutlass::DeviceAllocation<int> device_cumulative_seqlen_kv_cache;
-
-  // struct PagedKVParams {
-  //   cutlass::DeviceAllocation<int> page_table;
-  //   int page_size = 0;
-  //   cutlass::DeviceAllocation<int> num_pages_per_seq;
-  // };
-  // PagedKVParams paged_kv_cache;
-
-  //
-  // Methods
-  //
-
   template <class ProblemShape>
-  auto initialize_varlen(const Arguments& params, const ProblemShape& problem_size) {
-    int num_batches = get<0>(problem_size);
-
+  auto initialize_varlen(const Flash_fwd_params& params, ProblemShape& problem_size) {
     ProblemShape problem_size_for_init = problem_size;
     get<0>(problem_size_for_init) = 1;  // concentrated batch
     get<3>(problem_size_for_init) = params.total_q;
@@ -272,267 +203,269 @@ struct KernelRunner {
     get<5>(problem_size_for_init) = params.total_k;
 
     ProblemShapeType problem_size_for_launch;
-    problem_size_for_launch.batch = get<0>(problem_size);
-    problem_size_for_launch.num_heads_q = get<1>(problem_size);
-    problem_size_for_launch.num_heads_kv = get<2>(problem_size);
-    problem_size_for_launch.seq_len_qo = cutlass::fmha::collective::VariableLength{params.seqlen_q, params.total_q};
-    problem_size_for_launch.seq_len_kv =
-        cutlass::fmha::collective::VariableLength{params.seqlen_knew, params.total_knew};
-    problem_size_for_launch.seq_len_kv_cache =
-        cutlass::fmha::collective::VariableLength{params.seqlen_k, params.total_k};
-    problem_size_for_launch.head_size_qk = get<6>(problem_size);
-    problem_size_for_launch.head_size_vo = get<7>(problem_size);
+
+    get<0>(problem_size_for_launch) = get<0>(problem_size);
+    get<1>(problem_size_for_launch) = get<1>(problem_size);
+    get<2>(problem_size_for_launch) = get<2>(problem_size);
+    get<3>(problem_size_for_launch) = cutlass::fmha::collective::VariableLength{params.seqlen_q, params.total_q};
+    get<4>(problem_size_for_launch) = cutlass::fmha::collective::VariableLength{params.seqlen_knew, params.total_knew};
+    get<5>(problem_size_for_launch) = cutlass::fmha::collective::VariableLength{params.seqlen_k, params.total_k};
+    get<6>(problem_size_for_launch) = get<6>(problem_size);
+    get<7>(problem_size_for_launch) = get<7>(problem_size);
 
     return cute::make_tuple(problem_size_for_init, problem_size_for_launch);
   }
 
   /// Initialize operands to be used in the GEMM and reference GEMM
-  ProblemShapeType initialize(const Arguments& params) {
+  ProblemShapeType initialize(const Flash_fwd_params& params) {
     auto problem_shape_in = cute::make_tuple(
-        params.b, params.h, params.h_k, params.seqlen_q, params.seqlen_knew, params.seqlen_k, params.d, params.dv);
-    ProblemShapeType shape;
+        params.b,    // batch
+        params.h,    // num_heads_q
+        params.h_k,  // num_heads_kv
+        params.seqlen_q,
+        params.seqlen_knew,
+        params.seqlen_k,
+        params.d,
+        params.dv);
 
+    ProblemShapeType problem_shape;
     decltype(problem_shape_in) problem_size;
 
     if constexpr (isVarLen) {
       auto [problem_shape_init, problem_shape_launch] = initialize_varlen(params, problem_shape_in);
       problem_size = problem_shape_init;
-      shape = problem_shape_launch;
+      problem_shape = problem_shape_launch;
     } else {
       problem_size = problem_shape_in;
-      shape = problem_shape_in;
+      problem_shape = problem_shape_in;
     }
 
     auto [batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, head_size_qk, head_size_vo] =
         problem_size;
-    // NHD format
-    stride_Q = cutlass::make_stride(
-        num_heads_q * head_size_qk, Int<1>{}, head_size_qk, head_size_qk * num_heads_q * seq_len_qo);
-    stride_K = cutlass::make_stride(
-        num_heads_kv * head_size_qk, Int<1>{}, head_size_qk, head_size_qk * num_heads_kv * seq_len_kv);
-    stride_V = cutlass::make_stride(
-        Int<1>{}, num_heads_kv * head_size_vo, head_size_vo, head_size_vo * num_heads_kv * seq_len_kv);
-    stride_K_cache = cutlass::make_stride(
-        num_heads_kv * head_size_qk, Int<1>{}, head_size_qk, head_size_qk * num_heads_kv * seq_len_kv_cache);
-    stride_V_cache = cutlass::make_stride(
-        Int<1>{}, num_heads_kv * head_size_vo, head_size_vo, head_size_vo * num_heads_kv * seq_len_kv_cache);
-    stride_O = cutlass::make_stride(
-        num_heads_q * head_size_vo, Int<1>{}, head_size_vo, head_size_vo * num_heads_q * seq_len_qo);
+    auto group_q_size = num_heads_q / num_heads_kv;
+    auto group_q_num = num_heads_q / group_q_size;
+
+    stride_Q =
+        cutlass::make_cute_packed_stride(StrideQ{}, cute::make_shape(seq_len_qo, num_heads_q * head_size_qk, batch));
+    stride_K =
+        cutlass::make_cute_packed_stride(StrideK{}, cute::make_shape(seq_len_kv, num_heads_kv * head_size_qk, batch));
+    stride_V =
+        cutlass::make_cute_packed_stride(StrideV{}, cute::make_shape(head_size_vo * num_heads_kv, seq_len_kv, batch));
+
+    stride_K_cache = cutlass::make_cute_packed_stride(
+        StrideK{}, cute::make_shape(seq_len_kv_cache, num_heads_kv * head_size_qk, batch));
+    stride_V_cache = cutlass::make_cute_packed_stride(
+        StrideV{}, cute::make_shape(head_size_vo * head_size_qk, seq_len_kv_cache, batch * num_heads_kv));
+    stride_O = cutlass::make_cute_packed_stride(
+        StrideQ{}, cute::make_shape(seq_len_qo * group_q_size, group_q_num * head_size_vo, batch));
 
     if constexpr (isVarLen) {
-      shape.seq_len_qo.cumulative_length = params.cu_seqlens_q;
-      shape.seq_len_kv.cumulative_length = params.cu_seqlens_knew;
-      shape.seq_len_kv_cache.cumulative_length = params.cu_seqlens_k;
+      get<3>(problem_shape).cumulative_length = params.cu_seqlens_q;
+      get<4>(problem_shape).cumulative_length = params.cu_seqlens_knew;
+      get<5>(problem_shape).cumulative_length = params.cu_seqlens_k;
     }
-    return shape;
+
+    return problem_shape;
   }
 
   // Note that the GemmUniversalAdapter currently doesn't support flash attention, which is why this
   // secondary `run` function is required to launch the kernel.
-  static void run(typename FMHADecodeKernel::Params params) {
-    namespace syclex = sycl::ext::oneapi::experimental;
-    namespace intelex = sycl::ext::intel::experimental;
+  // static void run(typename FMHAChunkPrefillKernel::Params params) {
+  // dim3 const block = FMHAChunkPrefillKernel::get_block_shape();
+  // dim3 const grid = FMHAChunkPrefillKernel::get_grid_shape(params);
 
-    dim3 const block = FMHADecodeKernel::get_block_shape();
-    dim3 const grid = FMHADecodeKernel::get_grid_shape(params);
+  // // configure smem size and carveout
+  // int smem_size = FMHAChunkPrefillKernel::SharedStorageSize;
 
-    // configure smem size and carveout
-    int smem_size = FMHADecodeKernel::SharedStorageSize;
+  // const auto sycl_block = compat::dim3(block.x, block.y, block.z);
+  // const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
 
-    const auto sycl_block = compat::dim3(block.x, block.y, block.z);
-    const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
+  // using namespace compat::experimental;
+  // compat::experimental::launch_properties launch_props{
+  //     sycl::ext::oneapi::experimental::work_group_scratch_size(smem_size),
+  // };
+  // compat::experimental::kernel_properties kernel_props{
+  //     sycl::ext::oneapi::experimental::sub_group_size<FMHAChunkPrefillKernel::DispatchPolicy::SubgroupSize>};
+  // compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
 
-    // Launch parameters depend on whether SYCL compiler supports work-group scratch memory extension
-    compat::experimental::launch_properties launch_props{
-        syclex::work_group_scratch_size(smem_size),
-    };
-    compat::experimental::kernel_properties kernel_props{
-        syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<256>};
-    compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
+  // sycl::ext::oneapi::experimental::launch_config config(policy.get_range(), policy.get_launch_properties());
+  // auto cgf = [&](::sycl::handler& cgh) {
+  //   auto KernelFunctor =
+  //       compat::experimental::detail::build_kernel_functor<cutlass::device_kernel<FMHAChunkPrefillKernel>>(
+  //           cgh, policy, params);
+  //   sycl::ext::oneapi::experimental::detail::
+  //       LaunchConfigAccess<sycl::nd_range<3>, decltype(policy.get_launch_properties())>
+  //           ConfigAccess(config);
+  //   cgh.parallel_for<KernelCur<FMHAChunkPrefillKernel>>(
+  //       ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
+  // };
+  // auto stream = at::xpu::getCurrentXPUStream();
+  // auto q = stream.queue();
+  // q.submit(cgf);
+  // }
 
-    sycl::ext::oneapi::experimental::launch_config config(policy.get_range(), policy.get_launch_properties());
-    auto cgf = [&](::sycl::handler& cgh) {
-      auto KernelFunctor = compat::experimental::detail::build_kernel_functor<cutlass::device_kernel<FMHADecodeKernel>>(
-          cgh, policy, params);
-      sycl::ext::oneapi::experimental::detail::
-          LaunchConfigAccess<sycl::nd_range<3>, decltype(policy.get_launch_properties())>
-              ConfigAccess(config);
-      cgh.parallel_for<KernelCur<FMHADecodeKernel>>(
-          ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
-    };
-    auto stream = at::xpu::getCurrentXPUStream();
-    auto q = stream.queue();
-    q.submit(cgf);
-  }
+  cutlass::Status run(const Flash_fwd_params& params, const cutlass::KernelHardwareInfo& hw_info) {
+    ProblemShapeType problem_size = initialize(params);
 
-  cutlass::Status run(const Arguments& params, const cutlass::KernelHardwareInfo& hw_info) {
-    ProblemShapeType shape = initialize(params);
-
-    typename FMHADecodeKernel::Arguments arguments{
-        {
-            shape,
-            static_cast<const ElementQ*>(params.q_ptr),
-            stride_Q,
-            nullptr,
-            stride_K,
-            nullptr,
-            stride_V,
-            static_cast<ElementO*>(params.o_ptr),
-            stride_O,
-            static_cast<const ElementV*>(params.k_ptr),
-            stride_K_cache,
-            static_cast<const ElementV*>(params.v_ptr),
-            stride_V_cache,
-        },
-        {params.softmax_scale, params.page_table, params.page_size, params.max_num_pages_per_seq},
-        {},
+    typename FMHAChunkPrefillKernel::Arguments arguments{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        problem_size,
+        {// static_cast<const ElementQ*>(params.q_ptr),
+         static_cast<const ElementQ*>(params.q_ptr),
+         stride_Q,
+         //  static_cast<const ElementK*>(params.knew_ptr),
+         //  stride_K,
+         //  static_cast<const ElementV*>(params.vnew_ptr),
+         //  stride_V,
+         static_cast<const ElementV*>(params.k_ptr),
+         stride_K_cache,
+         static_cast<const ElementV*>(params.v_ptr),
+         stride_V_cache,
+         params.page_table,
+         params.page_size,
+         params.max_num_pages_per_seq,
+         params.window_size_left,
+         params.window_size_right},
+        {params.scale_softmax},
+        {static_cast<const ElementOutput*>(params.o_ptr),
+         stride_O,
+         static_cast<const ElementSink*>(params.sink_softmax)},
         hw_info};
 
     // Define device-global scratch memory
-    size_t workspace_size = FMHADecodeKernel::get_workspace_size(arguments);
-    cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+    size_t workspace_size = FMHAChunkPrefillKernel::get_workspace_size(arguments);
+    auto workspace = torch::empty(workspace_size, params.tensor_opts);
 
-    if (!FMHADecodeKernel::can_implement(arguments)) {
-      // std::cout << "Invalid Problem Size: " << params.b << 'x' << params.num_heads_q << 'x' << params.seq_len_qo
-      //           << 'x' << params.seq_len_kv << 'x' << params.head_size_qk << 'x' << params.head_size_vo
-      //           << (params.is_causal ? "xCausal" : "xNonCausal") << std::endl;
+    if (!FMHAChunkPrefillKernel::can_implement(arguments)) {
       return cutlass::Status::kErrorInvalidProblem;
     }
 
     // Initialize the workspace
-    FMHADecodeKernel::initialize_workspace(arguments, workspace.get());
+    (FMHAChunkPrefillKernel::initialize_workspace(arguments, workspace.data_ptr()));
 
     // Convert host-side arguments to device-side arguments to be passed to the kernel
-    auto kernel_params = FMHADecodeKernel::to_underlying_arguments(arguments, workspace.get());
+    auto params_kernel = FMHAChunkPrefillKernel::to_underlying_arguments(arguments, workspace.data_ptr());
 
-    // Run
-    run(kernel_params);
+    // Run the Flash Attention implementation.
+    // run(params_kernel);
+    launch<FMHAChunkPrefillKernel>(params_kernel);
     return cutlass::Status::kSuccess;
   }
 };
-
+// the default value used for the case BF16
 template <
-    bool Causal,
-    bool LocalMask,
-    bool Sink,
     typename TileShapeQK,
     typename TileShapePV,
     typename TileShapeOutput,
-    typename SubgroupLayoutQK,
-    typename SubgroupLayoutPV_ = void, /* void -> default */
-    int PipelineStages = 1,
-    bool persistent = false,
-    typename ElementQ = bfloat16_t,
-    typename ElementK = bfloat16_t,
-    typename ElementV = bfloat16_t,
-    typename ElementO = bfloat16_t,
-    typename MMAOperation_ = void, /* void -> default */
-    typename StrideQ = Stride<int, _1, int, int>,
-    typename StrideK = Stride<int, _1, int, int>,
-    typename StrideV = Stride<_1, int, int, int>,
-    typename StrideO = Stride<int, _1, int, int>,
-    typename GmemTiledCopyQ = void, /* void -> default block 2D */
-    typename GmemTiledCopyK = void,
-    typename GmemTiledCopyV = void,
-    typename GmemTiledCopyO = void>
-struct FMHAConfig {
-  static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
-  using MMAOperation = cute::conditional_t<
-      is_void_v<MMAOperation_>,
-      typename cute::conditional_t<
-          cute::is_same_v<ElementQ, cutlass::float_e5m2_t> || cute::is_same_v<ElementQ, cutlass::float_e4m3_t>,
-          XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, half_t>,
-          XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, ElementQ>>,
-      MMAOperation_>;
-  using SubgroupLayoutPV = cute::conditional_t<
-      is_void_v<SubgroupLayoutPV_>,
-      decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{})),
-      SubgroupLayoutPV_>;
-
-  template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
-  static int run(const Arguments& params) {
-    //
-    // Run examples
-    //
-
+    typename SubgroupLayout,
+    int PipelineStages,
+    bool Causal = false,
+    bool LocalMask = false,
+    bool Sink = false,
+    typename ElementInputQ = bfloat16_t,
+    typename ElementInputKV = bfloat16_t,
+    typename MMAOperation = XE_8x16x16_F32BF16BF16F32_TT,
+    typename GmemTiledCopyQ = XE_2D_U16x8x32_LD_N,
+    typename GmemTiledCopyK = XE_2D_U16x16x16_LD_T,  // _T designates a transposed block load operation
+    typename GmemTiledCopyV = XE_2D_U16x16x32_LD_V,
+    typename ElementAccumulator = float,
+    typename ElementComputeEpilogue = float,
+    typename ElementOutput = bfloat16_t,
+    typename ElementSink = bfloat16_t,
+    typename GmemTiledCopyStore = XE_2D_U16x8x16_ST_N>
+struct ChunkPrefillConfig {
+  template <bool isVarLen, bool PagedKV, class Scheduler>
+  static int run(const Flash_fwd_params& params) {
     // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
     // information is used by the underlying kernel.
     cutlass::KernelHardwareInfo hw_info;
-    hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
-    using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<isVarLen>;
+    using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16<PipelineStages>;
+    using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeXMX16;
+    using CollectiveEpilogue = cutlass::flash_attention::collective::FlashChunkPrefillEpilogue<
+        Sink,
+        EpilogueDispatchPolicy,
+        MMAOperation,
+        TileShapeOutput,
+        SubgroupLayout,
+        ElementComputeEpilogue,
+        ElementOutput,
+        cutlass::gemm::TagToStrideC_t<LayoutO>,
+        ElementOutput,
+        GmemTiledCopyStore,
+        ElementSink>;
+    using CollectiveSoftmaxEpilogue = cutlass::flash_attention::collective::
+        FlashChunkPrefillSoftmaxEpilogue<Causal, LocalMask, EpilogueDispatchPolicy, ElementAccumulator>;
 
-    using TiledMMAQK = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<TileShapeQK>, SubgroupLayoutQK>::TiledMMA;
-    using TiledMMAPV = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<TileShapePV>, SubgroupLayoutPV>::TiledMMA;
-
-    static_assert(
-        get<0>(TileShapeOutput{}) == get<0>(TileShapePV{}),
-        "Output tile and P*V tile have different sizes in Q dimension");
-    constexpr int VTiles = get<1>(TileShapeOutput{}) / get<1>(TileShapePV{});
-
-    auto make_dummy_tensor = [&](auto val, auto stride) {
-      return make_tensor(make_gmem_ptr(&val), make_layout(repeat<rank_v<decltype(stride)>>(1), stride));
-    };
-
-    using TensorQ = decltype(make_dummy_tensor(ElementQ{}, StrideQ{}));
-    using TensorK = decltype(make_dummy_tensor(ElementK{}, StrideK{}));
-    using TensorV = decltype(make_dummy_tensor(ElementV{}, StrideV{}));
-    using TensorO = decltype(make_dummy_tensor(ElementO{}, StrideO{}));
-    using TensorK_cache = TensorK;
-    using TensorV_cache = TensorV;
-    using GmemTiledCopyK_cache = GmemTiledCopyK;
-    using GmemTiledCopyV_cache = GmemTiledCopyV;
+    using ProblemShapeRegular = cute::tuple<int, int, int, int, int, int, int, int>;
+    using namespace cutlass::fmha::collective;
+    using ProblemShapeVarlen = cute::tuple<int, int, int, VariableLength, VariableLength, VariableLength, int, int>;
+    using ProblemShapeType = std::conditional_t<isVarLen, ProblemShapeVarlen, ProblemShapeRegular>;
 
     // Mainloop
-    using MainloopDispatchPolicy = cutlass::fmha::XeDefault<PipelineStages>;
-    using CollectiveMainloop = cutlass::fmha::collective::FMHAFwdMainloop<
-        MainloopDispatchPolicy,
+    using CollectiveMainloop = cutlass::flash_attention::collective::FlashChunkPrefillMma<
+        GEMMDispatchPolicy,
+        ProblemShapeType,
+        ElementInputQ,
+        cutlass::gemm::TagToStrideA_t<LayoutQ>,
+        ElementInputKV,
+        cutlass::gemm::TagToStrideB_t<LayoutK>,
+        ElementInputKV,
+        cutlass::gemm::TagToStrideB_t<LayoutV>,
+        MMAOperation,
+        TileShapeQK,
+        TileShapePV,
+        SubgroupLayout,
+        GmemTiledCopyQ,  // Q
+        GmemTiledCopyK,  // K
+        GmemTiledCopyV,  // V,
         Causal,
-        CachedKV,
-        PagedKV,
-        TiledMMAQK,
-        TiledMMAPV,
-        VTiles,
-        TensorQ,
-        TensorK,
-        TensorV,
-        TensorK_cache,
-        TensorV_cache,
-        GmemTiledCopyQ,
-        GmemTiledCopyK,
-        GmemTiledCopyV,
-        GmemTiledCopyK_cache,
-        GmemTiledCopyV_cache>;
+        LocalMask,
+        PagedKV>;
 
-    // Epilogue
-    using CollectiveEpilogue =
-        cutlass::fmha::collective::FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO>;
+    using FMHAChunkPrefillKernel = cutlass::flash_attention::kernel::FMHAPrefillChunk<
+        ProblemShapeType,
+        CollectiveMainloop,
+        CollectiveSoftmaxEpilogue,
+        CollectiveEpilogue,
+        Scheduler>;
 
-    static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
-    using FMHADecodeKernel = conditional_t<
-        is_same_v<Scheduler, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>,
-        cutlass::fmha::kernel::
-            XeFMHAFwdDynamicSplitKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>,
-        cutlass::fmha::kernel::XeFMHAFwdKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>>;
+    ChunkPrefillRunner<FMHAChunkPrefillKernel, isVarLen> runner;
 
-    KernelRunner<FMHADecodeKernel, isVarLen> kernel;
-
-    kernel.run(params, hw_info);
+    (runner.run(params, hw_info));
     return 0;
   }
 
-  static int run(const Arguments& params) {
+  static int run(const Flash_fwd_params& params) {
+    // only support varlen and paged kv now
     if (params.page_table != nullptr && params.cu_seqlens_k != nullptr) {
-      // template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
-      return run<true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+      return run<true, true, cutlass::flash_attention::IndividualScheduler>(params);
     } else {
-      throw std::runtime_error("Only support paged KV cache with variable length sequences");
       return 0;
     }
   }
 };
 
-std::vector<at::Tensor> flash_decode(
+inline int round_up_headdim(int head_size) {
+  if (head_size <= 64) {
+    return 64;
+  }
+  if (head_size <= 96) {
+    return 96;
+  }
+  if (head_size <= 128) {
+    return 128;
+  }
+  if (head_size <= 192) {
+    return 192;
+  }
+  if (head_size <= 256) {
+    return 256;
+  }
+  return 256;
+}
+
+std::vector<at::Tensor> mha_fwd(
     at::Tensor& q,        // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
                           // h_k, d) if there is page_table.
@@ -654,19 +587,7 @@ std::vector<at::Tensor> flash_decode(
   at::Tensor out;
   out = torch::empty({total_q, num_heads, head_size_v}, opts);
 
-  auto round_multiple = [](int x, int m) -> int { return (x + m - 1) / m * m; };
-  auto nextPowerOf2 = [](uint32_t a) -> int {
-    if (a <= 1) return 1;
-    // __builtin_clz 找到最高位 1 前面有多少个 0
-    return 1 << (32 - __builtin_clz(a - 1));
-  };
-  auto round_up_headdim = [](int head_size) -> int {
-    if (head_size <= 64) return 64;
-    if (head_size <= 96) return 96;
-    if (head_size <= 128) return 128;
-    if (head_size <= 192) return 192;
-    return 256;
-  };
+  auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
   int const head_size_rounded = round_up_headdim(head_size);
   int const head_size_v_rounded = head_size_v == head_size ? head_size_rounded : round_up_headdim(head_size_v);
   int const seqlen_q_rounded = round_multiple(seqlen_q, 128);
@@ -680,7 +601,7 @@ std::vector<at::Tensor> flash_decode(
   softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
 
   // align with FA3
-  Arguments params;
+  Flash_fwd_params params;
   params.is_bf16 = q.dtype() == torch::kBFloat16;
 
   // Set the pointers and strides.
@@ -717,9 +638,9 @@ std::vector<at::Tensor> flash_decode(
   params.d_rounded = head_size_rounded;
 
   // Set the different scale values.
-  params.softmax_scale = softmax_scale;
+  params.scale_softmax = softmax_scale;
   bool use_sink = sinks_.has_value();
-  params.softmax_sink_ptr = use_sink ? sinks_.value().data_ptr() : nullptr;
+  params.sink_softmax = use_sink ? sinks_.value().data_ptr() : nullptr;
 
   params.softcap = softcap;
 
@@ -813,77 +734,124 @@ std::vector<at::Tensor> flash_decode(
   at::Tensor out_accum, softmax_lse_accum;
   auto outaccum_type = at::ScalarType::Float;
 
-  constexpr bool Causal = false;  // The decode kernel does not support causal mode. It must be set to false.
-
-  auto launch_kernel = [&](auto _QG_SZ, auto _HEAD_DIM, auto _PAGE_SIZE, auto _NUM_SG) {
-    using TileShapeQK = cute::Shape<decltype(_QG_SZ), decltype(_PAGE_SIZE), _64>;
-    using TileShapePV = cute::Shape<decltype(_QG_SZ), _32, decltype(_PAGE_SIZE)>;
-    using TileShapeOutput = cute::Shape<decltype(_QG_SZ), decltype(_HEAD_DIM)>;
-    using SubgroupLayoutQK = cute::Layout<cute::Shape<_1, decltype(_NUM_SG), _1>>;
-
-    AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
-      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-        FMHAConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(params);
-      });
-    });
-  };
-
-  auto dispatch_page_size = [&](auto _QG_SZ, auto _HEAD_DIM) {
-    switch (params.page_size) {
-      case 32:
-        launch_kernel(_QG_SZ, _HEAD_DIM, _32{}, _2{});
-        break;
-      case 64:
-        launch_kernel(_QG_SZ, _HEAD_DIM, _64{}, _4{});
-        break;
-      case 128:
-        launch_kernel(_QG_SZ, _HEAD_DIM, _128{}, _8{});
-        break;
-      default:
-        TORCH_CHECK(false, "Unsupported page size for decode attention: ", params.page_size);
-    }
-  };
-
-  auto dispatch_q_group = [&](auto _HEAD_DIM) {
-    switch (nextPowerOf2(max_seqlen_q)) {
-      case 1:
-        dispatch_page_size(_1{}, _HEAD_DIM);
-        break;
-      case 2:
-        dispatch_page_size(_2{}, _HEAD_DIM);
-        break;
-      case 4:
-        dispatch_page_size(_4{}, _HEAD_DIM);
-        break;
-      case 8:
-        dispatch_page_size(_8{}, _HEAD_DIM);
-        break;
-      case 16:
-        dispatch_page_size(_16{}, _HEAD_DIM);
-        break;
-      case 32:
-        dispatch_page_size(_32{}, _HEAD_DIM);
-        break;
-      default:
-        TORCH_CHECK(false, "Unsupported qgroup_size for decode attention: ", max_seqlen_q);
-    }
-  };
-
+  constexpr int PipelineStages = 2;
   switch (params.d) {
     case 64:
-      dispatch_q_group(_64{});
+      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+        if (params.is_causal) {
+          ChunkPrefillConfig<
+              cute::Shape<_128, _64, _64>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _64, _64>,
+              cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true,
+              false,
+              Sink>::run(params);
+        } else {
+          AT_DISPATCH_BOOL_NO_RETURN(
+              params.is_local,
+              LocalMask,
+              ChunkPrefillConfig<
+                  cute::Shape<_128, _64, _64>,
+                  cute::Shape<_128, _32, _64>,
+                  cute::Shape<_128, _64, _64>,
+                  cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+                  PipelineStages,
+                  false,
+                  LocalMask,
+                  Sink>::run(params))
+        }
+      })
       break;
     case 96:
-      dispatch_q_group(_96{});
+      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+        if (params.is_causal) {
+          ChunkPrefillConfig<
+              cute::Shape<_128, _64, _32>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _96, _64>,
+              cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true,
+              false,
+              Sink>::run(params);
+
+        } else {
+          AT_DISPATCH_BOOL_NO_RETURN(
+              params.is_local,
+              LocalMask,
+              ChunkPrefillConfig<
+                  cute::Shape<_128, _64, _32>,
+                  cute::Shape<_128, _32, _64>,
+                  cute::Shape<_128, _96, _64>,
+                  cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+                  PipelineStages,
+                  false,
+                  LocalMask,
+                  Sink>::run(params))
+        }
+      })
       break;
     case 128:
-      dispatch_q_group(_128{});
+      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+        if (params.is_causal) {
+          ChunkPrefillConfig<
+              cute::Shape<_128, _64, _64>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _128, _64>,
+              cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true,
+              false,
+              Sink>::run(params);
+        } else {
+          AT_DISPATCH_BOOL_NO_RETURN(
+              params.is_local,
+              LocalMask,
+              ChunkPrefillConfig<
+                  cute::Shape<_128, _64, _64>,
+                  cute::Shape<_128, _32, _64>,
+                  cute::Shape<_128, _128, _64>,
+                  cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
+                  PipelineStages,
+                  false,
+                  LocalMask,
+                  Sink>::run(params))
+        }
+      })
       break;
     case 192:
-      dispatch_q_group(_192{});
+      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+        if (params.is_causal) {
+          ChunkPrefillConfig<
+              cute::Shape<_256, _64, _64>,
+              cute::Shape<_256, _32, _64>,
+              cute::Shape<_256, _192, _64>,
+              cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true,
+              false,
+              Sink>::run(params);
+        } else {
+          AT_DISPATCH_BOOL_NO_RETURN(
+              params.is_local,
+              LocalMask,
+              ChunkPrefillConfig<
+                  cute::Shape<_256, _64, _64>,
+                  cute::Shape<_256, _32, _64>,
+                  cute::Shape<_256, _192, _64>,
+                  cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+                  PipelineStages,
+                  false,
+                  LocalMask,
+                  Sink>::run(params))
+        }
+      })
       break;
     default:
-      TORCH_CHECK(false, "Unsupported head size for decode attention: ", params.d);
+      TORCH_CHECK(false, "Unsupported head size for causal attention");
   }
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
+}  // namespace chunkprefill
