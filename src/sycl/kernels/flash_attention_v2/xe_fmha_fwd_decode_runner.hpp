@@ -1082,79 +1082,84 @@ std::vector<at::Tensor> mha_fwd(
   using SubgroupLayoutQK = Layout<Shape<_1, _4, _1>>;
   // SplitDeodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput,
   // SubgroupLayoutQK>::run(params);
-  SplitDeodeConfig<false, false, false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK>::kernel_dispatch(params);
+  // SplitDeodeConfig<false, false, false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK>::kernel_dispatch(params);
 
-  // auto launch_kernel = [&](auto _QG_SZ, auto _HEAD_DIM, auto _PAGE_SIZE, auto _NUM_SG) {
-  //   using TileShapeQK = cute::Shape<decltype(_QG_SZ), decltype(_PAGE_SIZE), _64>;
-  //   using TileShapePV = cute::Shape<decltype(_QG_SZ), _32, decltype(_PAGE_SIZE)>;
-  //   using TileShapeOutput = cute::Shape<decltype(_QG_SZ), decltype(_HEAD_DIM)>;
-  //   using SubgroupLayoutQK = cute::Layout<cute::Shape<_1, decltype(_NUM_SG), _1>>;
+  auto launch_kernel = [&](auto _QG_SZ, auto _HEAD_DIM, auto _PAGE_SIZE, auto _NUM_SG) {
+    using TileShapeQK = cute::Shape<decltype(_QG_SZ), decltype(_PAGE_SIZE), _64>;
+    using TileShapePV = cute::Shape<decltype(_QG_SZ), _32, decltype(_PAGE_SIZE)>;
+    using TileShapeOutput = cute::Shape<decltype(_QG_SZ), decltype(_HEAD_DIM)>;
+    using SubgroupLayoutQK = cute::Layout<cute::Shape<_1, decltype(_NUM_SG), _1>>;
 
-  //   AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
-  //     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-  //       DecodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput,
-  //       SubgroupLayoutQK>::run(params);
-  //     });
-  //   });
-  // };
+    AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+        if (params.use_split_kv_decode) {
+          SplitDeodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::
+              kernel_dispatch(params);
+        } else {
+          DecodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(
+              params);
+        }
+      });
+    });
+  };
 
-  // auto dispatch_page_size = [&](auto _QG_SZ, auto _HEAD_DIM) {
-  //   switch (params.page_size) {
-  //     case 32:
-  //       launch_kernel(_QG_SZ, _HEAD_DIM, _32{}, _2{});
-  //       break;
-  //     case 64:
-  //       launch_kernel(_QG_SZ, _HEAD_DIM, _64{}, _4{});
-  //       break;
-  //     case 128:
-  //       launch_kernel(_QG_SZ, _HEAD_DIM, _128{}, _8{});
-  //       break;
-  //     default:
-  //       TORCH_CHECK(false, "Unsupported page size for decode attention: ", params.page_size);
-  //   }
-  // };
+  auto dispatch_page_size = [&](auto _QG_SZ, auto _HEAD_DIM) {
+    switch (params.page_size) {
+      case 32:
+        launch_kernel(_QG_SZ, _HEAD_DIM, _32{}, _2{});
+        break;
+      case 64:
+        launch_kernel(_QG_SZ, _HEAD_DIM, _64{}, _4{});
+        break;
+      case 128:
+        launch_kernel(_QG_SZ, _HEAD_DIM, _128{}, _8{});
+        break;
+      default:
+        TORCH_CHECK(false, "Unsupported page size for decode attention: ", params.page_size);
+    }
+  };
 
-  // auto dispatch_q_group = [&](auto _HEAD_DIM) {
-  //   switch (nextPowerOf2(max_seqlen_q)) {
-  //     case 1:
-  //       dispatch_page_size(_1{}, _HEAD_DIM);
-  //       break;
-  //     case 2:
-  //       dispatch_page_size(_2{}, _HEAD_DIM);
-  //       break;
-  //     case 4:
-  //       dispatch_page_size(_4{}, _HEAD_DIM);
-  //       break;
-  //     case 8:
-  //       dispatch_page_size(_8{}, _HEAD_DIM);
-  //       break;
-  //     case 16:
-  //       dispatch_page_size(_16{}, _HEAD_DIM);
-  //       break;
-  //     case 32:
-  //       dispatch_page_size(_32{}, _HEAD_DIM);
-  //       break;
-  //     default:
-  //       TORCH_CHECK(false, "Unsupported qgroup_size for decode attention: ", max_seqlen_q);
-  //   }
-  // };
+  auto dispatch_q_group = [&](auto _HEAD_DIM) {
+    switch (nextPowerOf2(max_seqlen_q)) {
+      case 1:
+        dispatch_page_size(_1{}, _HEAD_DIM);
+        break;
+      case 2:
+        dispatch_page_size(_2{}, _HEAD_DIM);
+        break;
+      case 4:
+        dispatch_page_size(_4{}, _HEAD_DIM);
+        break;
+      case 8:
+        dispatch_page_size(_8{}, _HEAD_DIM);
+        break;
+      case 16:
+        dispatch_page_size(_16{}, _HEAD_DIM);
+        break;
+      case 32:
+        dispatch_page_size(_32{}, _HEAD_DIM);
+        break;
+      default:
+        TORCH_CHECK(false, "Unsupported qgroup_size for decode attention: ", max_seqlen_q);
+    }
+  };
 
-  // switch (params.d) {
-  //   case 64:
-  //     dispatch_q_group(_64{});
-  //     break;
-  //   case 96:
-  //     dispatch_q_group(_96{});
-  //     break;
-  //   case 128:
-  //     dispatch_q_group(_128{});
-  //     break;
-  //   case 192:
-  //     dispatch_q_group(_192{});
-  //     break;
-  //   default:
-  //     TORCH_CHECK(false, "Unsupported head size for decode attention: ", params.d);
-  // }
+  switch (params.d) {
+    case 64:
+      dispatch_q_group(_64{});
+      break;
+    case 96:
+      dispatch_q_group(_96{});
+      break;
+    case 128:
+      dispatch_q_group(_128{});
+      break;
+    case 192:
+      dispatch_q_group(_192{});
+      break;
+    default:
+      TORCH_CHECK(false, "Unsupported head size for decode attention: ", params.d);
+  }
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
 }  // namespace decode
