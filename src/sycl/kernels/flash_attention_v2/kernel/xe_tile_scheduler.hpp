@@ -108,6 +108,93 @@ struct XeFHMAIndividualTileScheduler {
   }
 };
 
+struct XeFMHAChunkPrefillPersistentTileScheduler {
+
+  struct Params {
+    int num_tasks = 0;
+    int num_persistent_wgs = 0;
+    int const* prefill_offsets = nullptr;
+    int const* decode_offsets = nullptr;
+    int batch = 0;
+    int num_heads_q = 0;
+    int prefill_tasks_per_v = 0;
+    int tasks_per_v = 0;
+  };
+
+  bool valid_ = true;
+  Params params;
+  int task_idx_ = 0;
+
+  CUTLASS_DEVICE
+  XeFMHAChunkPrefillPersistentTileScheduler(Params const& params)
+      : valid_(BlockIdxX() < params.num_tasks), params(params), task_idx_(BlockIdxX()) {}
+
+  template <class ProblemShape, class TileShape>
+  static Params to_underlying_arguments(
+      ProblemShape const& shape, KernelHardwareInfo hw_info,
+      TileShape const& tile_shape)
+  {
+    constexpr int PersistentWaves = 8;
+    int num_persistent_wgs = cute::min(shape.scheduler_num_tasks, hw_info.sm_count * PersistentWaves);
+    return Params{shape.scheduler_num_tasks, num_persistent_wgs, shape.scheduler_prefill_offsets,
+            shape.scheduler_decode_offsets, shape.batch, shape.num_heads_q,
+          shape.scheduler_prefill_tasks_per_v, shape.scheduler_tasks_per_v};
+  }
+
+  template <int Num_SGs>
+  static dim3 get_grid_shape(Params const& params) {
+    return dim3(params.num_persistent_wgs, 1, 1);
+  }
+
+  CUTLASS_DEVICE
+  bool is_valid() {
+    return valid_;
+  }
+
+  CUTLASS_DEVICE
+  int find_batch(int const* offsets, int value) const {
+    int lower = 0;
+    int upper = params.batch;
+    while (lower + 1 < upper) {
+      int middle = (lower + upper) / 2;
+      if (offsets[middle] <= value) {
+        lower = middle;
+      } else {
+        upper = middle;
+      }
+    }
+    return lower;
+  }
+
+  CUTLASS_DEVICE
+  auto get_block_coord() {
+    using namespace cute;
+    int blk_v = task_idx_ / params.tasks_per_v;
+    int task_in_v = task_idx_ - blk_v * params.tasks_per_v;
+    if (task_in_v < params.prefill_tasks_per_v) {
+      int idx_b = find_batch(params.prefill_offsets, task_in_v);
+      int local_task = task_in_v - params.prefill_offsets[idx_b];
+      int batch_tasks = params.prefill_offsets[idx_b + 1] - params.prefill_offsets[idx_b];
+      int num_q_blocks = batch_tasks / params.num_heads_q;
+      int head = local_task / num_q_blocks;
+      int blk_q = local_task - head * num_q_blocks;
+      return make_coord(blk_q, blk_v, head, idx_b);
+    }
+
+    int decode_batch_head = task_in_v - params.prefill_tasks_per_v;
+    int idx_b = find_batch(params.decode_offsets, decode_batch_head);
+    int head = decode_batch_head - params.decode_offsets[idx_b];
+    return make_coord(0, blk_v, head, idx_b);
+  }
+
+  CUTLASS_DEVICE
+  XeFMHAChunkPrefillPersistentTileScheduler& operator++() {
+    task_idx_ += GridDimX();
+    valid_ = task_idx_ < params.num_tasks;
+    return *this;
+  }
+};
+
 struct XeFHMAIndividualPersistentTileScheduler {
   struct Params {
     dim3 grid;

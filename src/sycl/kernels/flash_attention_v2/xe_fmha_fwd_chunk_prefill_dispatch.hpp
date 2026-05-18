@@ -30,26 +30,4 @@
  **************************************************************************************************/
 #pragma once
 
-#include "xe_fmha_fwd_prefill_runner.hpp"
-#include "xe_fmha_fwd_chunk_prefill_dispatch.hpp"
-
-namespace prefill {
-
-// Explicit instantiation declarations — tell the compiler these are compiled
-// in separate translation units (generated from the .cpp.in templates).
-//
-// Parameters:
-//   HEAD_DIM in {64, 96, 128, 192, 256, 512}
-
-#define EXTERN_FMHA_PREFILL_RUNNER(HD) extern template struct FmhaPrefillRunner<HD>;
-
-EXTERN_FMHA_PREFILL_RUNNER(64)
-EXTERN_FMHA_PREFILL_RUNNER(96)
-EXTERN_FMHA_PREFILL_RUNNER(128)
-EXTERN_FMHA_PREFILL_RUNNER(192)
-EXTERN_FMHA_PREFILL_RUNNER(256)
-EXTERN_FMHA_PREFILL_RUNNER(512)
-
-#undef EXTERN_FMHA_PREFILL_RUNNER
-
-}  // namespace prefill
+#include "xe_fmha_fwd_chunk_prefill_runner.hpp"

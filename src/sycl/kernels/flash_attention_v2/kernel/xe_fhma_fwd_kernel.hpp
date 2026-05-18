@@ -53,6 +53,11 @@ struct FMHAProblemShape {
   int num_heads_q, num_heads_kv;
   SeqLenType seq_len_qo, seq_len_kv, seq_len_kv_cache;
   int head_size_qk, head_size_vo;
+  int scheduler_num_tasks = 0;
+  int const* scheduler_prefill_offsets = nullptr;
+  int const* scheduler_decode_offsets = nullptr;
+  int scheduler_prefill_tasks_per_v = 0;
+  int scheduler_tasks_per_v = 0;
 };
 
 ///////////////////////////////////////////////////////////////////////////////
