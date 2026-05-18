@@ -5,15 +5,11 @@
 
 #include <cute/tensor.hpp>
 
-#include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/util/packed_stride.hpp"
 #include "sycl/Utils.h"
 #include "sycl/comm/common.h"
 #include "sycl/kernels/flash_attention_v2/collective/fmha_fusion.hpp"
-#include "tile_scheduler_chunk_prefill.hpp"
-#include "xe_chunk_prefill.hpp"
-#include "xe_flash_attn_chunk_prefill_epilogue.hpp"
-#include "xe_flash_attn_chunk_prefill_softmax_epilogue.hpp"
+#include "sycl/kernels/chunk_prefill/xe_fmha_fwd_kernel.hpp"
 
 using namespace cute;
 namespace chunkprefill {
@@ -151,6 +147,13 @@ struct Flash_fwd_params {
   int* __restrict__ num_splits_dynamic_ptr;
   bool skip_scheduler_metadata_computation;
 
+  // Scheduler metadata for chunk prefill
+  int scheduler_num_tasks = 0;
+  int const* scheduler_prefill_offsets = nullptr;
+  int const* scheduler_decode_offsets = nullptr;
+  int scheduler_prefill_tasks_per_v = 0;
+  int scheduler_tasks_per_v = 0;
+
   torch::TensorOptions tensor_opts;
 };
 
@@ -160,25 +163,22 @@ using LayoutK = cutlass::layout::ColumnMajor;
 using LayoutV = cutlass::layout::RowMajor;
 using LayoutO = cutlass::layout::RowMajor;
 
-template <class FMHAChunkPrefillKernel, bool isVarLen>
+template <class FMHAKernel, bool isVarLen>
 struct ChunkPrefillRunner {
-  using StrideQ = typename FMHAChunkPrefillKernel::StrideQ;
-  using StrideK = typename FMHAChunkPrefillKernel::StrideK;
-  using StrideV = typename FMHAChunkPrefillKernel::StrideV;
-  using StrideO = typename FMHAChunkPrefillKernel::StrideO;
+  using StrideQ = typename FMHAKernel::StrideQ;
+  using StrideK = typename FMHAKernel::StrideK;
+  using StrideV = typename FMHAKernel::StrideV;
+  using StrideO = typename FMHAKernel::StrideO;
 
-  using ElementQ = typename FMHAChunkPrefillKernel::ElementQ;
-  using ElementK = typename FMHAChunkPrefillKernel::ElementK;
-  using ElementV = typename FMHAChunkPrefillKernel::ElementV;
-  using ElementAcc = typename FMHAChunkPrefillKernel::ElementAccumulator;
-  using ElementSink = typename FMHAChunkPrefillKernel::ElementSink;
+  using ElementQ = typename FMHAKernel::ElementQ;
+  using ElementK = typename FMHAKernel::ElementK;
+  using ElementV = typename FMHAKernel::ElementV;
+  using ElementO = typename FMHAKernel::ElementO;
 
-  using CollectiveEpilogue = typename FMHAChunkPrefillKernel::CollectiveEpilogue;
-  using ElementOutput = typename CollectiveEpilogue::ElementOutput;
-  using ElementCompute = typename CollectiveEpilogue::ElementCompute;
-  using ElementAccumulator = typename CollectiveEpilogue::ElementAccumulator;
+  using CollectiveMainloop = typename FMHAKernel::CollectiveMainloop;
+  using ElementS = typename CollectiveMainloop::ElementS;
 
-  using ProblemShapeType = typename FMHAChunkPrefillKernel::ProblemShape;
+  using ProblemShapeType = cutlass::fmha::chunk_prefill::ChunkPrefillProblemShape<isVarLen>;
 
   //
   // Data members
@@ -193,23 +193,29 @@ struct ChunkPrefillRunner {
   StrideO stride_O;
 
   template <class ProblemShape>
-  auto initialize_varlen(const Flash_fwd_params& params, ProblemShape& problem_size) {
+  auto initialize_varlen(const Flash_fwd_params& params, const ProblemShape& problem_size) {
     ProblemShape problem_size_for_init = problem_size;
     get<0>(problem_size_for_init) = 1;  // concentrated batch
+    get<1>(problem_size_for_init) = params.h;
     get<3>(problem_size_for_init) = params.total_q;
     get<4>(problem_size_for_init) = params.total_knew;
     get<5>(problem_size_for_init) = params.total_k;
 
-    ProblemShapeType problem_size_for_launch;
-
-    get<0>(problem_size_for_launch) = get<0>(problem_size);
-    get<1>(problem_size_for_launch) = get<1>(problem_size);
-    get<2>(problem_size_for_launch) = get<2>(problem_size);
-    get<3>(problem_size_for_launch) = cutlass::fmha::collective::VariableLength{params.seqlen_q, params.total_q};
-    get<4>(problem_size_for_launch) = cutlass::fmha::collective::VariableLength{params.seqlen_knew, params.total_knew};
-    get<5>(problem_size_for_launch) = cutlass::fmha::collective::VariableLength{params.seqlen_k, params.total_k};
-    get<6>(problem_size_for_launch) = get<6>(problem_size);
-    get<7>(problem_size_for_launch) = get<7>(problem_size);
+    ProblemShapeType problem_size_for_launch{
+        .batch = get<0>(problem_size),
+        .num_heads_q = get<1>(problem_size),
+        .num_heads_kv = get<2>(problem_size),
+        .seq_len_qo = {params.seqlen_q, params.total_q},
+        .seq_len_kv = {params.seqlen_knew, params.total_knew},
+        .seq_len_kv_cache = {params.seqlen_k, params.total_k},
+        .head_size_qk = get<6>(problem_size),
+        .head_size_vo = get<7>(problem_size),
+        .scheduler_num_tasks = params.scheduler_num_tasks,
+        .scheduler_prefill_offsets = params.scheduler_prefill_offsets,
+        .scheduler_decode_offsets = params.scheduler_decode_offsets,
+        .scheduler_prefill_tasks_per_v = params.scheduler_prefill_tasks_per_v,
+        .scheduler_tasks_per_v = params.scheduler_tasks_per_v,
+    };
 
     return cute::make_tuple(problem_size_for_init, problem_size_for_launch);
   }
@@ -217,194 +223,199 @@ struct ChunkPrefillRunner {
   /// Initialize operands to be used in the GEMM and reference GEMM
   ProblemShapeType initialize(const Flash_fwd_params& params) {
     auto problem_shape_in = cute::make_tuple(
-        params.b,    // batch
-        params.h,    // num_heads_q
-        params.h_k,  // num_heads_kv
-        params.seqlen_q,
-        params.seqlen_knew,
-        params.seqlen_k,
-        params.d,
-        params.dv);
+        params.b, params.h, params.h_k, params.seqlen_q, params.seqlen_knew, params.seqlen_k, params.d, params.dv);
+    ProblemShapeType shape;
 
-    ProblemShapeType problem_shape;
     decltype(problem_shape_in) problem_size;
 
     if constexpr (isVarLen) {
       auto [problem_shape_init, problem_shape_launch] = initialize_varlen(params, problem_shape_in);
       problem_size = problem_shape_init;
-      problem_shape = problem_shape_launch;
+      shape = problem_shape_launch;
     } else {
       problem_size = problem_shape_in;
-      problem_shape = problem_shape_in;
+      auto [batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, head_size_qk, head_size_vo] =
+          problem_size;
+      shape = ProblemShapeType{
+          batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, head_size_qk, head_size_vo};
     }
 
     auto [batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, head_size_qk, head_size_vo] =
         problem_size;
-    auto group_q_size = num_heads_q / num_heads_kv;
-    auto group_q_num = num_heads_q / group_q_size;
 
-    stride_Q =
-        cutlass::make_cute_packed_stride(StrideQ{}, cute::make_shape(seq_len_qo, num_heads_q * head_size_qk, batch));
-    stride_K =
-        cutlass::make_cute_packed_stride(StrideK{}, cute::make_shape(seq_len_kv, num_heads_kv * head_size_qk, batch));
-    stride_V =
-        cutlass::make_cute_packed_stride(StrideV{}, cute::make_shape(head_size_vo * num_heads_kv, seq_len_kv, batch));
-
-    stride_K_cache = cutlass::make_cute_packed_stride(
-        StrideK{}, cute::make_shape(seq_len_kv_cache, num_heads_kv * head_size_qk, batch));
-    stride_V_cache = cutlass::make_cute_packed_stride(
-        StrideV{}, cute::make_shape(head_size_vo * head_size_qk, seq_len_kv_cache, batch * num_heads_kv));
-    stride_O = cutlass::make_cute_packed_stride(
-        StrideQ{}, cute::make_shape(seq_len_qo * group_q_size, group_q_num * head_size_vo, batch));
+    // NHD format
+    stride_Q = cutlass::make_stride(
+        num_heads_q * head_size_qk, Int<1>{}, head_size_qk, head_size_qk * num_heads_q * seq_len_qo);
+    stride_K = cutlass::make_stride(
+        num_heads_kv * head_size_qk, Int<1>{}, head_size_qk, head_size_qk * num_heads_kv * seq_len_kv);
+    stride_V = cutlass::make_stride(
+        Int<1>{}, num_heads_kv * head_size_vo, head_size_vo, head_size_vo * num_heads_kv * seq_len_kv);
+    stride_K_cache = cutlass::make_stride(
+        num_heads_kv * head_size_qk, Int<1>{}, head_size_qk, head_size_qk * num_heads_kv * seq_len_kv_cache);
+    stride_V_cache = cutlass::make_stride(
+        Int<1>{}, num_heads_kv * head_size_vo, head_size_vo, head_size_vo * num_heads_kv * seq_len_kv_cache);
+    stride_O = cutlass::make_stride(
+        num_heads_q * head_size_vo, Int<1>{}, head_size_vo, head_size_vo * num_heads_q * seq_len_qo);
 
     if constexpr (isVarLen) {
-      get<3>(problem_shape).cumulative_length = params.cu_seqlens_q;
-      get<4>(problem_shape).cumulative_length = params.cu_seqlens_knew;
-      get<5>(problem_shape).cumulative_length = params.cu_seqlens_k;
+      shape.seq_len_qo.cumulative_length = params.cu_seqlens_q;
+      shape.seq_len_kv.cumulative_length = params.cu_seqlens_knew;
+      shape.seq_len_kv_cache.cumulative_length = params.cu_seqlens_k;
     }
 
-    return problem_shape;
+    return shape;
   }
 
   cutlass::Status run(const Flash_fwd_params& params, const cutlass::KernelHardwareInfo& hw_info) {
-    ProblemShapeType problem_size = initialize(params);
+    ProblemShapeType shape = initialize(params);
 
-    typename FMHAChunkPrefillKernel::Arguments arguments{
-        cutlass::gemm::GemmUniversalMode::kGemm,
-        problem_size,
-        {// static_cast<const ElementQ*>(params.q_ptr),
-         static_cast<const ElementQ*>(params.q_ptr),
-         stride_Q,
-         //  static_cast<const ElementK*>(params.knew_ptr),
-         //  stride_K,
-         //  static_cast<const ElementV*>(params.vnew_ptr),
-         //  stride_V,
-         static_cast<const ElementV*>(params.k_ptr),
-         stride_K_cache,
-         static_cast<const ElementV*>(params.v_ptr),
-         stride_V_cache,
-         params.page_table,
-         params.page_size,
-         params.max_num_pages_per_seq,
-         params.window_size_left,
-         params.window_size_right},
-        {params.scale_softmax},
-        {static_cast<const ElementOutput*>(params.o_ptr),
-         stride_O,
-         static_cast<const ElementSink*>(params.sink_softmax)},
+    typename FMHAKernel::Arguments arguments{
+        {
+            shape,
+            static_cast<const ElementQ*>(params.q_ptr),
+            stride_Q,
+            nullptr,
+            stride_K,
+            nullptr,
+            stride_V,
+            static_cast<ElementO*>(params.o_ptr),
+            stride_O,
+            static_cast<const ElementK*>(params.k_ptr),
+            stride_K_cache,
+            static_cast<const ElementV*>(params.v_ptr),
+            stride_V_cache,
+        },
+        {params.scale_softmax, params.page_table, params.page_size, params.max_num_pages_per_seq},
+        {},
         hw_info};
 
     // Define device-global scratch memory
-    size_t workspace_size = FMHAChunkPrefillKernel::get_workspace_size(arguments);
+    size_t workspace_size = FMHAKernel::get_workspace_size(arguments);
     auto workspace = torch::empty(workspace_size, params.tensor_opts);
 
-    if (!FMHAChunkPrefillKernel::can_implement(arguments)) {
+    if (!FMHAKernel::can_implement(arguments)) {
       return cutlass::Status::kErrorInvalidProblem;
     }
 
     // Initialize the workspace
-    FMHAChunkPrefillKernel::initialize_workspace(arguments, workspace.data_ptr());
+    FMHAKernel::initialize_workspace(arguments, workspace.data_ptr());
 
     // Convert host-side arguments to device-side arguments to be passed to the kernel
-    auto params_kernel = FMHAChunkPrefillKernel::to_underlying_arguments(arguments, workspace.data_ptr());
+    auto kernel_params = FMHAKernel::to_underlying_arguments(arguments, workspace.data_ptr());
 
     // Run the Flash Attention implementation.
-    // run(params_kernel);
-    launch<FMHAChunkPrefillKernel>(params_kernel);
+    launch<FMHAKernel>(kernel_params);
     return cutlass::Status::kSuccess;
   }
 };
 
-// the default value used for the case BF16
 template <
+    bool Causal,
     typename TileShapeQK,
     typename TileShapePV,
     typename TileShapeOutput,
-    typename SubgroupLayout,
-    int PipelineStages,
-    bool Causal = false,
-    bool LocalMask = false,
-    bool Sink = false,
-    typename ElementInputQ = bfloat16_t,
-    typename ElementInputKV = bfloat16_t,
-    typename MMAOperation = XE_8x16x16_F32BF16BF16F32_TT,
-    typename GmemTiledCopyQ = XE_2D_U16x8x32_LD_N,
-    typename GmemTiledCopyK = XE_2D_U16x16x16_LD_T,  // _T designates a transposed block load operation
-    typename GmemTiledCopyV = XE_2D_U16x16x32_LD_V,
-    typename ElementAccumulator = float,
-    typename ElementComputeEpilogue = float,
-    typename ElementOutput = bfloat16_t,
-    typename ElementSink = bfloat16_t,
-    typename GmemTiledCopyStore = XE_2D_U16x8x16_ST_N>
+    typename SubgroupLayoutQK,
+    int PipelineStages = 2,
+    typename ElementQ = bfloat16_t,
+    typename ElementK = bfloat16_t,
+    typename ElementV = bfloat16_t,
+    typename ElementO = bfloat16_t,
+    typename MMAOperation_ = void,
+    typename StrideQ = Stride<int, _1, int, int>,
+    typename StrideK = Stride<int, _1, int, int>,
+    typename StrideV = Stride<_1, int, int, int>,
+    typename StrideO = Stride<int, _1, int, int>,
+    typename GmemTiledCopyQ = void,
+    typename GmemTiledCopyK = void,
+    typename GmemTiledCopyV = void,
+    typename GmemTiledCopyO = void>
 struct ChunkPrefillConfig {
-  template <bool isVarLen, bool PagedKV, class Scheduler>
+  static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
+  using MMAOperation = cute::conditional_t<
+      is_void_v<MMAOperation_>,
+      XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, ElementQ>,
+      MMAOperation_>;
+  using SubgroupLayoutPV = decltype(cutlass::fmha::chunk_prefill::chunk_prefill_get_sg_layout_pv(SubgroupLayoutQK{}));
+
+  template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
   static int run(const Flash_fwd_params& params) {
-    // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
-    // information is used by the underlying kernel.
     cutlass::KernelHardwareInfo hw_info;
+    hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
-    using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16<PipelineStages>;
-    using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeXMX16;
-    using CollectiveEpilogue = cutlass::flash_attention::collective::FlashChunkPrefillEpilogue<
-        Sink,
-        EpilogueDispatchPolicy,
-        MMAOperation,
-        TileShapeOutput,
-        SubgroupLayout,
-        ElementComputeEpilogue,
-        ElementOutput,
-        cutlass::gemm::TagToStrideC_t<LayoutO>,
-        ElementOutput,
-        GmemTiledCopyStore,
-        ElementSink>;
-    using CollectiveSoftmaxEpilogue = cutlass::flash_attention::collective::
-        FlashChunkPrefillSoftmaxEpilogue<Causal, LocalMask, EpilogueDispatchPolicy, ElementAccumulator>;
+    using ProblemShapeType = cutlass::fmha::chunk_prefill::ChunkPrefillProblemShape<isVarLen>;
 
-    using ProblemShapeRegular = cute::tuple<int, int, int, int, int, int, int, int>;
-    using namespace cutlass::fmha::collective;
-    using ProblemShapeVarlen = cute::tuple<int, int, int, VariableLength, VariableLength, VariableLength, int, int>;
-    using ProblemShapeType = std::conditional_t<isVarLen, ProblemShapeVarlen, ProblemShapeRegular>;
+    using TiledMMAQK = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<TileShapeQK>, SubgroupLayoutQK>::TiledMMA;
+    using TiledMMAPV = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<TileShapePV>, SubgroupLayoutPV>::TiledMMA;
+
+    static_assert(
+        get<0>(TileShapeOutput{}) == get<0>(TileShapePV{}),
+        "Output tile and P*V tile have different sizes in Q dimension");
+    constexpr int VTiles = get<1>(TileShapeOutput{}) / get<1>(TileShapePV{});
+
+    auto make_dummy_tensor = [&](auto val, auto stride) {
+      return make_tensor(make_gmem_ptr(&val), make_layout(repeat<rank_v<decltype(stride)>>(1), stride));
+    };
+
+    using TensorQ = decltype(make_dummy_tensor(ElementQ{}, StrideQ{}));
+    using TensorK = decltype(make_dummy_tensor(ElementK{}, StrideK{}));
+    using TensorV = decltype(make_dummy_tensor(ElementV{}, StrideV{}));
+    using TensorO = decltype(make_dummy_tensor(ElementO{}, StrideO{}));
+    using TensorK_cache = TensorK;
+    using TensorV_cache = TensorV;
+    using GmemTiledCopyK_cache = GmemTiledCopyK;
+    using GmemTiledCopyV_cache = GmemTiledCopyV;
 
     // Mainloop
-    using CollectiveMainloop = cutlass::flash_attention::collective::FlashChunkPrefillMma<
-        GEMMDispatchPolicy,
-        ProblemShapeType,
-        ElementInputQ,
-        cutlass::gemm::TagToStrideA_t<LayoutQ>,
-        ElementInputKV,
-        cutlass::gemm::TagToStrideB_t<LayoutK>,
-        ElementInputKV,
-        cutlass::gemm::TagToStrideB_t<LayoutV>,
-        MMAOperation,
-        TileShapeQK,
-        TileShapePV,
-        SubgroupLayout,
-        GmemTiledCopyQ,  // Q
-        GmemTiledCopyK,  // K
-        GmemTiledCopyV,  // V,
+    using MainloopDispatchPolicy = cutlass::fmha::chunk_prefill::ChunkPrefillDefault<PipelineStages>;
+    using CollectiveMainloop = cutlass::fmha::chunk_prefill::ChunkPrefillMainloop<
+        MainloopDispatchPolicy,
         Causal,
-        LocalMask,
-        PagedKV>;
+        CachedKV,
+        PagedKV,
+        TiledMMAQK,
+        TiledMMAPV,
+        VTiles,
+        TensorQ,
+        TensorK,
+        TensorV,
+        TensorK_cache,
+        TensorV_cache,
+        GmemTiledCopyQ,
+        GmemTiledCopyK,
+        GmemTiledCopyV,
+        GmemTiledCopyK_cache,
+        GmemTiledCopyV_cache>;
 
-    using FMHAChunkPrefillKernel = cutlass::flash_attention::kernel::FMHAPrefillChunk<
+    // Epilogue
+    using CollectiveEpilogue =
+        cutlass::fmha::chunk_prefill::ChunkPrefillEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO>;
+
+    using FMHAKernel = cutlass::fmha::chunk_prefill::ChunkPrefillFwdKernel<
         ProblemShapeType,
         CollectiveMainloop,
-        CollectiveSoftmaxEpilogue,
         CollectiveEpilogue,
         Scheduler>;
 
-    ChunkPrefillRunner<FMHAChunkPrefillKernel, isVarLen> runner;
+    ChunkPrefillRunner<FMHAKernel, isVarLen> runner;
 
-    (runner.run(params, hw_info));
+    runner.run(params, hw_info);
     return 0;
   }
 
   static int run(const Flash_fwd_params& params) {
-    // only support varlen now
-    if (params.page_table != nullptr) {
-      return run<true, true, cutlass::flash_attention::IndividualScheduler>(params);
+    // Use the chunk prefill persistent tile scheduler when scheduler metadata is available
+    if (params.scheduler_num_tasks > 0) {
+      if (params.page_table != nullptr) {
+        return run<true, true, true, cutlass::fmha::chunk_prefill::XeFMHAChunkPrefillPersistentTileScheduler>(params);
+      } else {
+        return run<true, true, false, cutlass::fmha::chunk_prefill::XeFMHAChunkPrefillPersistentTileScheduler>(params);
+      }
     } else {
-      return run<true, false, cutlass::flash_attention::IndividualScheduler>(params);
+      if (params.page_table != nullptr) {
+        return run<true, true, true, cutlass::fmha::chunk_prefill::XeFHMAIndividualTileScheduler>(params);
+      } else {
+        return run<true, true, false, cutlass::fmha::chunk_prefill::XeFHMAIndividualTileScheduler>(params);
+      }
     }
   }
 };
@@ -460,8 +471,6 @@ std::vector<at::Tensor> mha_fwd(
     std::optional<bool> pack_gqa_,
     int const sm_margin) {
   // TODO: check GPU support
-  // auto dprops = at::cuda::getCurrentDeviceProperties();
-  // TORCH_CHECK(drops->name.find("B580") != std::string::npos, "sgl_kernel_xpu only supports BMG+");
 
   auto q_type = q.scalar_type();
   TORCH_CHECK(
@@ -520,9 +529,6 @@ std::vector<at::Tensor> mha_fwd(
       head_size <= max_headdim,
       "FlashAttention forward only supports head dimension at most " + std::to_string(max_headdim));
   TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
-
-  // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
-  // TODO: check this
 
   if (window_size_left >= seqlen_k - 1) {
     window_size_left = -1;
@@ -691,185 +697,95 @@ std::vector<at::Tensor> mha_fwd(
     params.kv_batch_idx = reinterpret_cast<int*>(kv_batch_idx.data_ptr());
   }
 
+  // Parse scheduler metadata if available
+  if (scheduler_metadata_.has_value()) {
+    auto sched_meta = scheduler_metadata_.value();
+    CHECK_INPUT(sched_meta);
+    TORCH_CHECK(sched_meta.dtype() == torch::kInt32, "scheduler_metadata must have dtype torch.int32");
+    auto sched_ptr = sched_meta.data_ptr<int>();
+    // The scheduler metadata tensor layout:
+    // [num_tasks, prefill_tasks_per_v, tasks_per_v, prefill_offsets...(b+1), decode_offsets...(b+1)]
+    params.scheduler_num_tasks = sched_ptr[0];
+    params.scheduler_prefill_tasks_per_v = sched_ptr[1];
+    params.scheduler_tasks_per_v = sched_ptr[2];
+    params.scheduler_prefill_offsets = sched_ptr + 3;
+    params.scheduler_decode_offsets = sched_ptr + 3 + batch_size + 1;
+  }
+
   params.tensor_opts = torch::TensorOptions().dtype(torch::kUInt8).device(q.device());
 
   at::Tensor out_accum, softmax_lse_accum;
   auto outaccum_type = at::ScalarType::Float;
 
   constexpr int PipelineStages = 2;
-  switch (params.d) {
-    case 64:
-      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
-        if (params.is_causal) {
-          ChunkPrefillConfig<
-              cute::Shape<_128, _64, _64>,
-              cute::Shape<_128, _32, _64>,
-              cute::Shape<_128, _64, _64>,
-              cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
-              PipelineStages,
-              true,
-              false,
-              Sink>::run(params);
-        } else {
-          AT_DISPATCH_BOOL_NO_RETURN(
-              params.is_local,
-              LocalMask,
-              ChunkPrefillConfig<
-                  cute::Shape<_128, _64, _64>,
-                  cute::Shape<_128, _32, _64>,
-                  cute::Shape<_128, _64, _64>,
-                  cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
-                  PipelineStages,
-                  false,
-                  LocalMask,
-                  Sink>::run(params))
-        }
-      })
-      break;
-    case 96:
-      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
-        if (params.is_causal) {
-          ChunkPrefillConfig<
-              cute::Shape<_128, _64, _32>,
-              cute::Shape<_128, _32, _64>,
-              cute::Shape<_128, _96, _64>,
-              cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
-              PipelineStages,
-              true,
-              false,
-              Sink>::run(params);
 
-        } else {
-          AT_DISPATCH_BOOL_NO_RETURN(
-              params.is_local,
-              LocalMask,
-              ChunkPrefillConfig<
-                  cute::Shape<_128, _64, _32>,
-                  cute::Shape<_128, _32, _64>,
-                  cute::Shape<_128, _96, _64>,
-                  cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
-                  PipelineStages,
-                  false,
-                  LocalMask,
-                  Sink>::run(params))
-        }
-      })
-      break;
-    case 128:
-      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
-        if (params.is_causal) {
-          ChunkPrefillConfig<
-              cute::Shape<_128, _64, _64>,
-              cute::Shape<_128, _32, _64>,
-              cute::Shape<_128, _128, _64>,
-              cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
-              PipelineStages,
-              true,
-              false,
-              Sink>::run(params);
-        } else {
-          AT_DISPATCH_BOOL_NO_RETURN(
-              params.is_local,
-              LocalMask,
-              ChunkPrefillConfig<
-                  cute::Shape<_128, _64, _64>,
-                  cute::Shape<_128, _32, _64>,
-                  cute::Shape<_128, _128, _64>,
-                  cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
-                  PipelineStages,
-                  false,
-                  LocalMask,
-                  Sink>::run(params))
-        }
-      })
-      break;
-    case 192:
-      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
-        if (params.is_causal) {
-          ChunkPrefillConfig<
-              cute::Shape<_256, _64, _64>,
-              cute::Shape<_256, _32, _64>,
-              cute::Shape<_256, _192, _64>,
-              cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
-              PipelineStages,
-              true,
-              false,
-              Sink>::run(params);
-        } else {
-          AT_DISPATCH_BOOL_NO_RETURN(
-              params.is_local,
-              LocalMask,
-              ChunkPrefillConfig<
-                  cute::Shape<_256, _64, _64>,
-                  cute::Shape<_256, _32, _64>,
-                  cute::Shape<_256, _192, _64>,
-                  cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
-                  PipelineStages,
-                  false,
-                  LocalMask,
-                  Sink>::run(params))
-        }
-      })
-      break;
-    case 256:
-      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
-        if (params.is_causal) {
-          ChunkPrefillConfig<
-              cute::Shape<_256, _64, _64>,
-              cute::Shape<_256, _32, _64>,
-              cute::Shape<_256, _256, _64>,
-              cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
-              PipelineStages,
-              true,
-              false,
-              Sink>::run(params);
-        } else {
-          AT_DISPATCH_BOOL_NO_RETURN(
-              params.is_local,
-              LocalMask,
-              ChunkPrefillConfig<
-                  cute::Shape<_256, _64, _64>,
-                  cute::Shape<_256, _32, _64>,
-                  cute::Shape<_256, _256, _64>,
-                  cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
-                  PipelineStages,
-                  false,
-                  LocalMask,
-                  Sink>::run(params))
-        }
-      })
-      break;
-    case 512:
-      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
-        if (params.is_causal) {
-          ChunkPrefillConfig<
-              cute::Shape<cute::Int<256>, _64, _64>,
-              cute::Shape<cute::Int<256>, _32, _64>,
-              cute::Shape<cute::Int<256>, cute::Int<512>, _64>,
-              cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
-              PipelineStages,
-              true,
-              false,
-              Sink>::run(params);
-        } else {
-          AT_DISPATCH_BOOL_NO_RETURN(
-              params.is_local,
-              LocalMask,
-              ChunkPrefillConfig<
-                  cute::Shape<cute::Int<256>, _64, _64>,
-                  cute::Shape<cute::Int<256>, _32, _64>,
-                  cute::Shape<cute::Int<256>, cute::Int<512>, _64>,
-                  cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
-                  PipelineStages,
-                  false,
-                  LocalMask,
-                  Sink>::run(params))
-        }
-      })
-      break;
-    default:
-      TORCH_CHECK(false, "Unsupported head size ", params.d, " for chunk-prefill MHA");
+  auto run_kernel = [&]<bool CausalFlag>() {
+    switch (params.d) {
+      case 64:
+        ChunkPrefillConfig<
+            CausalFlag,
+            cute::Shape<_128, _64, _64>,
+            cute::Shape<_128, _32, _64>,
+            cute::Shape<_128, _64>,
+            cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+            PipelineStages>::run(params);
+        break;
+      case 96:
+        ChunkPrefillConfig<
+            CausalFlag,
+            cute::Shape<_128, _64, _32>,
+            cute::Shape<_128, _32, _64>,
+            cute::Shape<_128, _96>,
+            cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+            PipelineStages>::run(params);
+        break;
+      case 128:
+        ChunkPrefillConfig<
+            CausalFlag,
+            cute::Shape<_128, _64, _64>,
+            cute::Shape<_128, _32, _64>,
+            cute::Shape<_128, _128>,
+            cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
+            PipelineStages>::run(params);
+        break;
+      case 192:
+        ChunkPrefillConfig<
+            CausalFlag,
+            cute::Shape<_256, _64, _64>,
+            cute::Shape<_256, _32, _64>,
+            cute::Shape<_256, _192>,
+            cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+            PipelineStages>::run(params);
+        break;
+      case 256:
+        ChunkPrefillConfig<
+            CausalFlag,
+            cute::Shape<_256, _64, _64>,
+            cute::Shape<_256, _32, _64>,
+            cute::Shape<_256, _256>,
+            cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+            PipelineStages>::run(params);
+        break;
+      case 512:
+        ChunkPrefillConfig<
+            CausalFlag,
+            cute::Shape<cute::Int<256>, _64, _64>,
+            cute::Shape<cute::Int<256>, _32, _64>,
+            cute::Shape<cute::Int<256>, cute::Int<512>>,
+            cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+            PipelineStages>::run(params);
+        break;
+      default:
+        TORCH_CHECK(false, "Unsupported head size ", params.d, " for chunk-prefill MHA");
+    }
+  };
+
+  if (params.is_causal) {
+    run_kernel.template operator()<true>();
+  } else {
+    run_kernel.template operator()<false>();
   }
+
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
 }  // namespace chunkprefill
