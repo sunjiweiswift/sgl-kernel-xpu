@@ -31,6 +31,7 @@
 #pragma once
 
 #include "xe_fmha_fwd_prefill_runner.hpp"
+#include "chunk_prefill_runner.hpp"
 
 namespace prefill {
 
