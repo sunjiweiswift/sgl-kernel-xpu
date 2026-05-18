@@ -30,9 +30,7 @@
  *
  **************************************************************************************************/
 
-
 #pragma once
-
 
 #include "cutlass/cutlass.h"
 #include "cutlass/fast_math.h"
@@ -41,7 +39,6 @@
 namespace cutlass::fmha::chunk_prefill {
 
 struct XeFHMAIndividualTileScheduler {
-
   struct Params {
     dim3 grid;
     FastDivmod divmod_num_heads;
@@ -54,15 +51,14 @@ struct XeFHMAIndividualTileScheduler {
   XeFHMAIndividualTileScheduler(Params const& params) : params(params) {}
 
   template <class ProblemShape, class TileShape>
-  static Params to_underlying_arguments(
-      ProblemShape const& shape, KernelHardwareInfo hw_info,
-      TileShape const& tile_shape)
-  {
+  static Params
+  to_underlying_arguments(ProblemShape const& shape, KernelHardwareInfo hw_info, TileShape const& tile_shape) {
     using namespace cute;
 
-    dim3 grid(size(ceil_div(shape.head_size_vo, get<1>(tile_shape))),     // V
-              size(ceil_div(shape.seq_len_qo,   get<0>(tile_shape))),     // Q
-              size(shape.batch * shape.num_heads_q));                     // (h,b) -- split later
+    dim3 grid(
+        size(ceil_div(shape.head_size_vo, get<1>(tile_shape))),  // V
+        size(ceil_div(shape.seq_len_qo, get<0>(tile_shape))),    // Q
+        size(shape.batch * shape.num_heads_q));                  // (h,b) -- split later
     return Params{grid, {shape.num_heads_q}};
   }
 
@@ -93,7 +89,6 @@ struct XeFHMAIndividualTileScheduler {
 };
 
 struct XeFMHAChunkPrefillPersistentTileScheduler {
-
   struct Params {
     int num_tasks = 0;
     int num_persistent_wgs = 0;
@@ -114,15 +109,19 @@ struct XeFMHAChunkPrefillPersistentTileScheduler {
       : valid_(BlockIdxX() < params.num_tasks), params(params), task_idx_(BlockIdxX()) {}
 
   template <class ProblemShape, class TileShape>
-  static Params to_underlying_arguments(
-      ProblemShape const& shape, KernelHardwareInfo hw_info,
-      TileShape const& tile_shape)
-  {
+  static Params
+  to_underlying_arguments(ProblemShape const& shape, KernelHardwareInfo hw_info, TileShape const& tile_shape) {
     constexpr int PersistentWaves = 8;
     int num_persistent_wgs = cute::min(shape.scheduler_num_tasks, hw_info.sm_count * PersistentWaves);
-    return Params{shape.scheduler_num_tasks, num_persistent_wgs, shape.scheduler_prefill_offsets,
-            shape.scheduler_decode_offsets, shape.batch, shape.num_heads_q,
-          shape.scheduler_prefill_tasks_per_v, shape.scheduler_tasks_per_v};
+    return Params{
+        shape.scheduler_num_tasks,
+        num_persistent_wgs,
+        shape.scheduler_prefill_offsets,
+        shape.scheduler_decode_offsets,
+        shape.batch,
+        shape.num_heads_q,
+        shape.scheduler_prefill_tasks_per_v,
+        shape.scheduler_tasks_per_v};
   }
 
   template <int Num_SGs>
@@ -180,7 +179,6 @@ struct XeFMHAChunkPrefillPersistentTileScheduler {
 };
 
 struct XeFHMAIndividualPersistentTileScheduler {
-
   struct Params {
     dim3 grid;
     FastDivmod divmod_num_heads;
@@ -194,20 +192,22 @@ struct XeFHMAIndividualPersistentTileScheduler {
   int num_batch_heads_;
 
   CUTLASS_DEVICE
-  XeFHMAIndividualPersistentTileScheduler(Params const& params, int kv_tile_size,
-    int local_num_kv_blocks, int num_batch_heads)
-    : params(params), kv_tile_size_(kv_tile_size), local_num_kv_blocks_(local_num_kv_blocks), num_batch_heads_(num_batch_heads) {}
+  XeFHMAIndividualPersistentTileScheduler(
+      Params const& params, int kv_tile_size, int local_num_kv_blocks, int num_batch_heads)
+      : params(params),
+        kv_tile_size_(kv_tile_size),
+        local_num_kv_blocks_(local_num_kv_blocks),
+        num_batch_heads_(num_batch_heads) {}
 
   template <class ProblemShape, class TileShape>
-  static Params to_underlying_arguments(
-      ProblemShape const& shape, KernelHardwareInfo hw_info,
-      TileShape const& tile_shape)
-  {
+  static Params
+  to_underlying_arguments(ProblemShape const& shape, KernelHardwareInfo hw_info, TileShape const& tile_shape) {
     using namespace cute;
 
-    dim3 grid(size(ceil_div(shape.head_size_vo, get<1>(tile_shape))),     // V
-              size(ceil_div(shape.seq_len_qo,   get<0>(tile_shape))),     // Q
-              size(shape.batch * shape.num_heads_q));                     // (h,b) -- split later
+    dim3 grid(
+        size(ceil_div(shape.head_size_vo, get<1>(tile_shape))),  // V
+        size(ceil_div(shape.seq_len_qo, get<0>(tile_shape))),    // Q
+        size(shape.batch * shape.num_heads_q));                  // (h,b) -- split later
     int num_heads = shape.num_heads_q;
     grid.z = hw_info.sm_count;
 

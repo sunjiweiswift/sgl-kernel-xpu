@@ -457,7 +457,7 @@ struct FmhaPrefillRunner {
 // Uses the chunk_prefill kernel/mainloop/epilogue/scheduler implementations.
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-#include "sycl/kernels/chunk_prefill/xe_fmha_fwd_kernel.hpp"
+#include "sycl/kernels/flash_attention_v2/kernel/chunk_prefill_kernel.hpp"
 
 namespace chunkprefill {
 struct Flash_fwd_params {
@@ -755,10 +755,8 @@ template <
     typename GmemTiledCopyO = void>
 struct ChunkPrefillConfig {
   static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
-  using MMAOperation = cute::conditional_t<
-      is_void_v<MMAOperation_>,
-      XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, ElementQ>,
-      MMAOperation_>;
+  using MMAOperation =
+      cute::conditional_t<is_void_v<MMAOperation_>, XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, ElementQ>, MMAOperation_>;
   using SubgroupLayoutPV = decltype(cutlass::fmha::chunk_prefill::chunk_prefill_get_sg_layout_pv(SubgroupLayoutQK{}));
 
   template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
@@ -809,14 +807,11 @@ struct ChunkPrefillConfig {
         GmemTiledCopyK_cache,
         GmemTiledCopyV_cache>;
 
-    using CollectiveEpilogue =
-        cutlass::fmha::chunk_prefill::ChunkPrefillEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO>;
+    using CollectiveEpilogue = cutlass::fmha::chunk_prefill::
+        ChunkPrefillEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO>;
 
-    using FMHAKernel = cutlass::fmha::chunk_prefill::ChunkPrefillFwdKernel<
-        ProblemShapeType,
-        CollectiveMainloop,
-        CollectiveEpilogue,
-        Scheduler>;
+    using FMHAKernel = cutlass::fmha::chunk_prefill::
+        ChunkPrefillFwdKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>;
 
     ChunkPrefillRunner<FMHAKernel, isVarLen> runner;
     runner.run(params, hw_info);

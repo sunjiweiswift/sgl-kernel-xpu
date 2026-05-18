@@ -31,16 +31,15 @@
 
 #pragma once
 
+#include "cute/util/type_traits.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/kernel_hardware_info.hpp"
-
-#include "sycl/kernels/chunk_prefill/xe_fmha_fwd_mainloop.hpp"
-#include "sycl/kernels/chunk_prefill/xe_fmha_fwd_epilogue.hpp"
-#include "cute/util/type_traits.hpp"
 #include "sycl/kernels/flash_attention_v2/collective/fmha_fusion.hpp"
-#include "sycl/kernels/chunk_prefill/xe_tile_scheduler.hpp"
+#include "sycl/kernels/flash_attention_v2/kernel/chunk_prefill_epilogue.hpp"
+#include "sycl/kernels/flash_attention_v2/kernel/chunk_prefill_mainloop.hpp"
+#include "sycl/kernels/flash_attention_v2/kernel/chunk_prefill_tile_scheduler.hpp"
 
 namespace cutlass::fmha::chunk_prefill {
 
@@ -65,8 +64,7 @@ struct ChunkPrefillProblemShape {
 
 template <class ProblemShape_, class CollectiveMainloop_, class CollectiveEpilogue_, class TileScheduler_>
 class ChunkPrefillFwdKernel {
-
-public:
+ public:
   //
   // Type Aliases
   //
@@ -117,23 +115,22 @@ public:
     EpilogueSharedStorage epilogue;
   };
 
-  static constexpr int SharedStorageSize = is_empty_v<SharedStorage> ? size_t(0)
-                                                                     : sizeof(SharedStorage);
+  static constexpr int SharedStorageSize = is_empty_v<SharedStorage> ? size_t(0) : sizeof(SharedStorage);
 
   // Device side arguments
   struct KernelArguments {
     ProblemShape shape;
-    const ElementQ *Q;
+    const ElementQ* Q;
     StrideQ dQ;
-    const ElementK *K;
+    const ElementK* K;
     StrideK dK;
-    const ElementV *V;
+    const ElementV* V;
     StrideV dV;
-    ElementO *O;
+    ElementO* O;
     StrideO dO;
-    const ElementK *K_cache;
+    const ElementK* K_cache;
     StrideK dK_cache{};
-    const ElementV *V_cache;
+    const ElementV* V_cache;
     StrideV dV_cache{};
   };
   using KernelParams = KernelArguments;
@@ -157,48 +154,57 @@ public:
   // Methods
   //
 
-  static Params to_underlying_arguments(Arguments const &args, void *workspace) {
-    return {args.kernel,
-            CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
-            CollectiveEpilogue::to_underlying_arguments(args.epilogue, workspace),
-            TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{})};
+  static Params to_underlying_arguments(Arguments const& args, void* workspace) {
+    return {
+        args.kernel,
+        CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
+        CollectiveEpilogue::to_underlying_arguments(args.epilogue, workspace),
+        TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{})};
   }
 
-  static bool can_implement(Arguments const &args) {
-    return CollectiveMainloop::can_implement(args.mainloop)
-        && CollectiveEpilogue::can_implement(args.epilogue);
+  static bool can_implement(Arguments const& args) {
+    return CollectiveMainloop::can_implement(args.mainloop) && CollectiveEpilogue::can_implement(args.epilogue);
   }
 
-  static int get_workspace_size(Arguments const &args) { return 0; }
+  static int get_workspace_size(Arguments const& args) {
+    return 0;
+  }
 
-  static cutlass::Status initialize_workspace(Arguments const &args, void *workspace = nullptr,
-                                              cudaStream_t stream = nullptr, CudaHostAdapter *cuda_adapter = nullptr) {
+  static cutlass::Status initialize_workspace(
+      Arguments const& args,
+      void* workspace = nullptr,
+      cudaStream_t stream = nullptr,
+      CudaHostAdapter* cuda_adapter = nullptr) {
     return Status::kSuccess;
   }
 
-  static dim3 get_grid_shape(Params const &params) {
+  static dim3 get_grid_shape(Params const& params) {
     return TileScheduler::template get_grid_shape<SGPerWG::value>(params.scheduler);
   }
 
-  static dim3 get_block_shape() { return dim3(SGPerWG::value * intel::sg_size, 1, 1); }
+  static dim3 get_block_shape() {
+    return dim3(SGPerWG::value * intel::sg_size, 1, 1);
+  }
 
   CUTLASS_DEVICE
   Shape<int, int, int> get_sequence_length_shape(ProblemShape const& problem_shape, int const& batch) {
     if constexpr (is_var_len) {
-      return cutlass::fmha::collective::apply_variable_length(Shape<VariableLength, VariableLength, VariableLength>{problem_shape.seq_len_qo, problem_shape.seq_len_kv, problem_shape.seq_len_kv_cache}, batch);
+      return cutlass::fmha::collective::apply_variable_length(
+          Shape<VariableLength, VariableLength, VariableLength>{
+              problem_shape.seq_len_qo, problem_shape.seq_len_kv, problem_shape.seq_len_kv_cache},
+          batch);
     } else {
       return Shape<int, int, int>{problem_shape.seq_len_qo, problem_shape.seq_len_kv, problem_shape.seq_len_kv_cache};
     }
   }
 
   CUTLASS_DEVICE
-  void operator()(Params const &params, char *smem_buf)
-  {
+  void operator()(Params const& params, char* smem_buf) {
     using namespace sycl::ext::oneapi::this_work_item;
 
-    SharedStorage& shared_storage = *reinterpret_cast<SharedStorage *>(smem_buf);
+    SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
-    auto &p = params.kernel;
+    auto& p = params.kernel;
     ProblemShape const& s = p.shape;
     int head_group_q = s.num_heads_q / s.num_heads_kv;
 
@@ -206,7 +212,7 @@ public:
     int sub_group_id = thr_id / intel::sg_size;
     int q_sg_tile = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})));
 
-    auto cS = make_identity_tensor(take<0,2>(TiledMMAQK{}.tile_mnk()));
+    auto cS = make_identity_tensor(take<0, 2>(TiledMMAQK{}.tile_mnk()));
     auto tScS = TiledMMAQK{}.get_slice(thr_id).partition_C(cS);
     auto q_offset_wi = get<0>(tScS(0));
     auto q_offset_sg = group_broadcast(sycl::ext::oneapi::this_work_item::get_sub_group(), q_offset_wi, 0);
@@ -215,7 +221,7 @@ public:
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
-      auto [blk_q, blk_v, head_q, idx_b] = tile_scheduler.get_block_coord(); // (Q,V,h,b)
+      auto [blk_q, blk_v, head_q, idx_b] = tile_scheduler.get_block_coord();  // (Q,V,h,b)
       auto blk_qv = make_coord(blk_q, blk_v);
       int head = head_q / head_group_q;
 
@@ -229,7 +235,9 @@ public:
       int seq_coord = cute::min(seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
 
       if (CollectiveMainloop::CausalMask && seq_coord < discard_seq_coord) continue;
-      const int seq_len_new = CollectiveMainloop::CausalMask ? full_tile_offset + cute::min(seq_len_kv, seq_coord - discard_seq_coord) + q_sg_tile : seq_len_kv;
+      const int seq_len_new = CollectiveMainloop::CausalMask
+                                  ? full_tile_offset + cute::min(seq_len_kv, seq_coord - discard_seq_coord) + q_sg_tile
+                                  : seq_len_kv;
       const int seq_len = seq_len_new + seq_len_kv_cache;
       const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
 
@@ -279,7 +287,6 @@ public:
       Tensor V_cache = make_tensor(make_gmem_ptr(dcV_cache), make_layout(shape_V_cache, stride_v_cache));
       Tensor O = make_tensor(make_gmem_ptr(ptrO), make_layout(shape_O, stride_o));
 
-
       // O accumulator types
       FragA tArA;
       FragARow tA_max, tA_sum;
@@ -287,15 +294,25 @@ public:
       // Main loop
       int l_coord = is_var_len ? 0 : idx_b;
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
-      mainloop(Q(_,_,head_q,l_coord),
-               K(_,_,head,l_coord),
-               V(_,_,head,l_coord),
-               tArA, tA_max, tA_sum,
-               blk_qv, 0, k_blocks, k_blocks,
-               thr_id, seq_len, seq_len_kv_cache, idx_b,
-               full_tile_offset, discard_seq_coord,
-               K_cache(_,_,head,l_coord),
-               V_cache(_,_,head,l_coord));
+      mainloop(
+          Q(_, _, head_q, l_coord),
+          K(_, _, head, l_coord),
+          V(_, _, head, l_coord),
+          tArA,
+          tA_max,
+          tA_sum,
+          blk_qv,
+          0,
+          k_blocks,
+          k_blocks,
+          thr_id,
+          seq_len,
+          seq_len_kv_cache,
+          idx_b,
+          full_tile_offset,
+          discard_seq_coord,
+          K_cache(_, _, head, l_coord),
+          V_cache(_, _, head, l_coord));
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());
@@ -303,17 +320,14 @@ public:
 
       // Epilogue
       CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
-      epilogue(O(_,_,head_q,l_coord),
-               tArA, tA_max, tA_sum,
-               blk_qv, thr_id);
+      epilogue(O(_, _, head_q, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id);
     }
   }
 };
 
 template <class ProblemShape_, class CollectiveMainloop_, class CollectiveEpilogue_, class TileScheduler_>
 class XeFMHAFwdDynamicSplitKernel {
-
-public:
+ public:
   //
   // Type Aliases
   //
@@ -367,8 +381,7 @@ public:
     EpilogueSharedStorage epilogue;
   };
 
-  static constexpr int SharedStorageSize = is_empty_v<SharedStorage> ? size_t(0)
-                                                                     : sizeof(SharedStorage);
+  static constexpr int SharedStorageSize = is_empty_v<SharedStorage> ? size_t(0) : sizeof(SharedStorage);
 
   // Important: make sure multiple of 16 element for each copy
   // this is for storing partial results from different KV partitions
@@ -378,17 +391,17 @@ public:
   // Device side arguments
   struct KernelArguments {
     ProblemShape shape;
-    const ElementQ *Q;
+    const ElementQ* Q;
     StrideQ dQ;
-    const ElementK *K;
+    const ElementK* K;
     StrideK dK;
-    const ElementV *V;
+    const ElementV* V;
     StrideV dV;
-    ElementO *O;
+    ElementO* O;
     StrideO dO;
-    const ElementK *K_cache = nullptr;
+    const ElementK* K_cache = nullptr;
     StrideK dK_cache{};
-    const ElementV *V_cache = nullptr;
+    const ElementV* V_cache = nullptr;
     StrideV dV_cache{};
   };
   using KernelParams = KernelArguments;
@@ -407,28 +420,29 @@ public:
     EpilogueParams epilogue;
     TileSchedulerParams scheduler;
     // workspace for storing partial results of different KV partitions
-    ElementA *partial_results_ptr = nullptr;
+    ElementA* partial_results_ptr = nullptr;
     // for atomic add
-    int32_t *atomic_reduce_cnt_ptr = nullptr;
+    int32_t* atomic_reduce_cnt_ptr = nullptr;
   };
 
   //
   // Methods
   //
 
-  static Params to_underlying_arguments(Arguments const &args, void *workspace) {
+  static Params to_underlying_arguments(Arguments const& args, void* workspace) {
     int num_batch_heads = args.kernel.shape.batch * args.kernel.shape.num_heads_q;
-    int32_t *atomic_reduce_cnt_ptr = reinterpret_cast<int32_t *>(workspace);
-    ElementA *partial_results_ptr = reinterpret_cast<ElementA *>(atomic_reduce_cnt_ptr + num_batch_heads);
-    return {args.kernel,
-            CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
-            CollectiveEpilogue::to_underlying_arguments(args.epilogue, workspace),
-            TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{}),
-            partial_results_ptr, atomic_reduce_cnt_ptr
-          };
+    int32_t* atomic_reduce_cnt_ptr = reinterpret_cast<int32_t*>(workspace);
+    ElementA* partial_results_ptr = reinterpret_cast<ElementA*>(atomic_reduce_cnt_ptr + num_batch_heads);
+    return {
+        args.kernel,
+        CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
+        CollectiveEpilogue::to_underlying_arguments(args.epilogue, workspace),
+        TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{}),
+        partial_results_ptr,
+        atomic_reduce_cnt_ptr};
   }
 
-  static bool can_implement(Arguments const &args) {
+  static bool can_implement(Arguments const& args) {
     // current kernel only support decode
     if (args.kernel.shape.seq_len_qo > 1) {
       return false;
@@ -437,11 +451,10 @@ public:
     if (args.kernel.shape.batch * args.kernel.shape.num_heads_q > args.hw_info.sm_count) {
       return false;
     }
-    return CollectiveMainloop::can_implement(args.mainloop)
-        && CollectiveEpilogue::can_implement(args.epilogue);
+    return CollectiveMainloop::can_implement(args.mainloop) && CollectiveEpilogue::can_implement(args.epilogue);
   }
 
-  static int get_workspace_size(Arguments const &args) {
+  static int get_workspace_size(Arguments const& args) {
     int ws_size = 0;
     int num_batch_heads = args.kernel.shape.batch * args.kernel.shape.num_heads_q;
     const int wg_size = SGPerWG::value * intel::sg_size;
@@ -453,8 +466,11 @@ public:
     return ws_size;
   }
 
-  static cutlass::Status initialize_workspace(Arguments const &args, void *workspace = nullptr,
-                                              cudaStream_t stream = nullptr, CudaHostAdapter *cuda_adapter = nullptr) {
+  static cutlass::Status initialize_workspace(
+      Arguments const& args,
+      void* workspace = nullptr,
+      cudaStream_t stream = nullptr,
+      CudaHostAdapter* cuda_adapter = nullptr) {
     int num_batch_heads = args.kernel.shape.batch * args.kernel.shape.num_heads_q;
     compat::fill(reinterpret_cast<int32_t*>(workspace), (int32_t)0, num_batch_heads);
     auto partial_ws_count = (get_workspace_size(args) - num_batch_heads * sizeof(int32_t)) / sizeof(ElementA);
@@ -463,14 +479,17 @@ public:
     return Status::kSuccess;
   }
 
-  static dim3 get_grid_shape(Params const &params) {
+  static dim3 get_grid_shape(Params const& params) {
     return TileScheduler::template get_grid_shape<SGPerWG::value>(params.scheduler);
   }
 
-  static dim3 get_block_shape() { return dim3(SGPerWG::value * intel::sg_size, 1, 1); }
+  static dim3 get_block_shape() {
+    return dim3(SGPerWG::value * intel::sg_size, 1, 1);
+  }
 
   CUTLASS_DEVICE
-  int get_partition_id(const int cur_wg_id, const int batch_head_id, const int num_blocks_per_wg, const int local_k_blocks) {
+  int get_partition_id(
+      const int cur_wg_id, const int batch_head_id, const int num_blocks_per_wg, const int local_k_blocks) {
     int partition_id = 0;
     if (batch_head_id == 0) {
       return cur_wg_id;
@@ -494,8 +513,14 @@ public:
   }
 
   template <class Params, class FragA, class FragARow>
-  CUTLASS_DEVICE
-  void reduce_split2(const Params &params, FragA &out1, FragARow& max_val1, FragARow& exp_sum_val1, FragA &out2, FragARow& max_val2, FragARow& exp_sum_val2) {
+  CUTLASS_DEVICE void reduce_split2(
+      const Params& params,
+      FragA& out1,
+      FragARow& max_val1,
+      FragARow& exp_sum_val1,
+      FragA& out2,
+      FragARow& max_val2,
+      FragARow& exp_sum_val2) {
     // global max value
     FragARow max_prev1 = max_val1;
     FragARow max_prev2 = max_val2;
@@ -525,13 +550,12 @@ public:
   }
 
   CUTLASS_DEVICE
-  void operator()(Params const &params, char *smem_buf)
-  {
+  void operator()(Params const& params, char* smem_buf) {
     using namespace sycl::ext::oneapi::this_work_item;
 
-    SharedStorage& shared_storage = *reinterpret_cast<SharedStorage *>(smem_buf);
+    SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
-    auto &p = params.kernel;
+    auto& p = params.kernel;
     ProblemShape const& s = p.shape;
     int head_group_q = s.num_heads_q / s.num_heads_kv;
 
@@ -552,10 +576,10 @@ public:
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
-      auto [blk_q, blk_v, start_batch_head_id] = tile_scheduler.get_block_coord(); // (Q,V, batch_head_idx)
+      auto [blk_q, blk_v, start_batch_head_id] = tile_scheduler.get_block_coord();  // (Q,V, batch_head_idx)
       auto blk_qv = make_coord(blk_q, blk_v);
 
-      auto shape_Q = make_shape(s.seq_len_qo, s.head_size_qk, s.num_heads_q,  s.batch);
+      auto shape_Q = make_shape(s.seq_len_qo, s.head_size_qk, s.num_heads_q, s.batch);
       auto shape_K = make_shape(s.seq_len_kv, s.head_size_qk, s.num_heads_kv, s.batch);
       auto shape_V = make_shape(s.head_size_vo, s.seq_len_kv, s.num_heads_kv, s.batch);
       auto shape_O = make_shape(s.seq_len_qo, s.head_size_vo, s.num_heads_q, s.batch);
@@ -564,10 +588,10 @@ public:
       auto dcK = const_cast<ElementK*>(p.K);
       auto dcV = const_cast<ElementV*>(p.V);
 
-      Tensor Q = make_tensor(make_gmem_ptr(dcQ), make_layout(shape_Q, p.dQ));    // (q,d,h,b)
-      Tensor K = make_tensor(make_gmem_ptr(dcK), make_layout(shape_K, p.dK));    // (k,d,h,b)
-      Tensor V = make_tensor(make_gmem_ptr(dcV), make_layout(shape_V, p.dV));    // (v,k,h,b)
-      Tensor O = make_tensor(make_gmem_ptr(p.O), make_layout(shape_O, p.dO));    // (q,v,h,b)
+      Tensor Q = make_tensor(make_gmem_ptr(dcQ), make_layout(shape_Q, p.dQ));  // (q,d,h,b)
+      Tensor K = make_tensor(make_gmem_ptr(dcK), make_layout(shape_K, p.dK));  // (k,d,h,b)
+      Tensor V = make_tensor(make_gmem_ptr(dcV), make_layout(shape_V, p.dV));  // (v,k,h,b)
+      Tensor O = make_tensor(make_gmem_ptr(p.O), make_layout(shape_O, p.dO));  // (q,v,h,b)
 
       auto shape_K_cache = make_shape(s.seq_len_kv_cache, s.head_size_qk, s.num_heads_kv, s.batch);
       auto shape_V_cache = make_shape(s.head_size_vo, s.seq_len_kv_cache, s.num_heads_kv, s.batch);
@@ -575,13 +599,15 @@ public:
       auto dcV_cache = const_cast<ElementV*>(p.V_cache);
       Tensor K_cache = make_tensor(make_gmem_ptr(dcK_cache), make_layout(shape_K_cache, p.dK_cache));
       Tensor V_cache = make_tensor(make_gmem_ptr(dcV_cache), make_layout(shape_V_cache, p.dV_cache));
-      
+
       // O accumulator types
       FragA tArA;
       FragARow tA_max, tA_sum;
 
       // compute num computed blocks for start batch head id
-      int num_computed_blocks = (start_batch_head_id == 0) ? (wg_id * num_blocks_per_wg) : (wg_id * num_blocks_per_wg - start_batch_head_id * local_k_blocks);
+      int num_computed_blocks = (start_batch_head_id == 0)
+                                    ? (wg_id * num_blocks_per_wg)
+                                    : (wg_id * num_blocks_per_wg - start_batch_head_id * local_k_blocks);
       int start_blk, end_blk, head_q, idx_b, head_kv;
       // leader wg is also responsible for reducing partial results, while other
       // worker wg only to compute partial results
@@ -623,26 +649,36 @@ public:
         idx_b = batch_head_id / s.num_heads_q;
         head_kv = head_q / head_group_q;
         // mainloop
-        mainloop(Q(_,_,head_q,idx_b),
-              K(_,_,head_kv,idx_b),
-              V(_,_,head_kv,idx_b),
-              tArA, tA_max, tA_sum,
-              blk_qv, start_blk, end_blk, local_k_blocks,
-              thr_id, s.seq_len_kv, 0, 0, 0, 0);
+        mainloop(
+            Q(_, _, head_q, idx_b),
+            K(_, _, head_kv, idx_b),
+            V(_, _, head_kv, idx_b),
+            tArA,
+            tA_max,
+            tA_sum,
+            blk_qv,
+            start_blk,
+            end_blk,
+            local_k_blocks,
+            thr_id,
+            s.seq_len_kv,
+            0,
+            0,
+            0,
+            0);
 
         // partition id of start batch head id in current wg
         int partition_id = get_partition_id(wg_id, batch_head_id, num_blocks_per_wg, local_k_blocks);
 
         // store partial result: tArA, tA_max and tA_sum
-        int offset = batch_head_id * max_num_partitions * num_elem_per_thread * SGPerWG::value * intel::sg_size
-                    + partition_id * num_elem_per_thread * SGPerWG::value * intel::sg_size
-                    + sg_id * intel::sg_size * num_elem_per_thread
-                    + tid_in_sg * num_elem_per_thread;
+        int offset = batch_head_id * max_num_partitions * num_elem_per_thread * SGPerWG::value * intel::sg_size +
+                     partition_id * num_elem_per_thread * SGPerWG::value * intel::sg_size +
+                     sg_id * intel::sg_size * num_elem_per_thread + tid_in_sg * num_elem_per_thread;
         Tensor tPartial = make_tensor(params.partial_results_ptr + offset, make_shape(Int<num_elem_per_thread>{}));
         Tensor merged_res = make_tensor<ElementA>(Int<num_elem_per_thread>{});
 
         CUTLASS_PRAGMA_UNROLL
-        for(int i = 0; i < size(FragA{}.shape()); ++i) {
+        for (int i = 0; i < size(FragA{}.shape()); ++i) {
           merged_res(i) = tArA(i);
         }
         CUTLASS_PRAGMA_UNROLL
@@ -670,24 +706,24 @@ public:
         int num_partitions = get_num_partitions(wg_id, num_blocks_per_wg, local_k_blocks);
 
         // check atomic to wait for partial results ready
-        while(atomicLoad(params.atomic_reduce_cnt_ptr + wg_id) != num_partitions) {}
+        while (atomicLoad(params.atomic_reduce_cnt_ptr + wg_id) != num_partitions) {
+        }
 
         clear(tArA);
         clear(tA_max);
         clear(tA_sum);
 
         for (int i = 0; i < num_partitions; ++i) {
-          int offset = wg_id * max_num_partitions * SGPerWG::value * intel::sg_size * num_elem_per_thread
-                     + i * SGPerWG::value * intel::sg_size * num_elem_per_thread
-                     + sg_id * intel::sg_size * num_elem_per_thread
-                     + tid_in_sg * num_elem_per_thread;
+          int offset = wg_id * max_num_partitions * SGPerWG::value * intel::sg_size * num_elem_per_thread +
+                       i * SGPerWG::value * intel::sg_size * num_elem_per_thread +
+                       sg_id * intel::sg_size * num_elem_per_thread + tid_in_sg * num_elem_per_thread;
           Tensor tPartial = make_tensor(params.partial_results_ptr + offset, make_shape(Int<num_elem_per_thread>{}));
           Tensor merged_res = make_tensor<ElementA>(Int<num_elem_per_thread>{});
           copy(tPartial, merged_res);
 
           if (i == 0) {
             CUTLASS_PRAGMA_UNROLL
-            for(int i = 0; i < size(FragA{}.shape()); ++i) {
+            for (int i = 0; i < size(FragA{}.shape()); ++i) {
               tArA(i) = merged_res(i);
             }
 
@@ -703,7 +739,7 @@ public:
           FragA tArA_2;
           FragARow tA_max_2, tA_sum_2;
           CUTLASS_PRAGMA_UNROLL
-          for(int i = 0; i < size(FragA{}.shape()); ++i) {
+          for (int i = 0; i < size(FragA{}.shape()); ++i) {
             tArA_2(i) = merged_res(i);
           }
 
@@ -727,12 +763,10 @@ public:
 
         // Epilogue
         CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
-        epilogue(O(_,_,head_q,idx_b),
-                tArA, tA_max, tA_sum,
-                blk_qv, thr_id);
+        epilogue(O(_, _, head_q, idx_b), tArA, tA_max, tA_sum, blk_qv, thr_id);
       }
     }
   }
 };
 
-} // namespace cutlass::fmha::chunk_prefill
+}  // namespace cutlass::fmha::chunk_prefill
