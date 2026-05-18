@@ -457,7 +457,7 @@ struct FmhaPrefillRunner {
 // Uses the chunk_prefill kernel/mainloop/epilogue/scheduler implementations.
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-#include "sycl/kernels/flash_attention_v2/kernel/chunk_prefill_kernel.hpp"
+#include "sycl/kernels/flash_attention_v2/kernel/xe_fhma_fwd_kernel.hpp"
 
 namespace chunkprefill {
 struct Flash_fwd_params {
