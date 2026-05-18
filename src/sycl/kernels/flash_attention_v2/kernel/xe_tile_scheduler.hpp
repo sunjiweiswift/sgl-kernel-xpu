@@ -109,7 +109,6 @@ struct XeFHMAIndividualTileScheduler {
 };
 
 struct XeFMHAChunkPrefillPersistentTileScheduler {
-
   struct Params {
     int num_tasks = 0;
     int num_persistent_wgs = 0;
@@ -130,15 +129,19 @@ struct XeFMHAChunkPrefillPersistentTileScheduler {
       : valid_(BlockIdxX() < params.num_tasks), params(params), task_idx_(BlockIdxX()) {}
 
   template <class ProblemShape, class TileShape>
-  static Params to_underlying_arguments(
-      ProblemShape const& shape, KernelHardwareInfo hw_info,
-      TileShape const& tile_shape)
-  {
+  static Params
+  to_underlying_arguments(ProblemShape const& shape, KernelHardwareInfo hw_info, TileShape const& tile_shape) {
     constexpr int PersistentWaves = 8;
     int num_persistent_wgs = cute::min(shape.scheduler_num_tasks, hw_info.sm_count * PersistentWaves);
-    return Params{shape.scheduler_num_tasks, num_persistent_wgs, shape.scheduler_prefill_offsets,
-            shape.scheduler_decode_offsets, shape.batch, shape.num_heads_q,
-          shape.scheduler_prefill_tasks_per_v, shape.scheduler_tasks_per_v};
+    return Params{
+        shape.scheduler_num_tasks,
+        num_persistent_wgs,
+        shape.scheduler_prefill_offsets,
+        shape.scheduler_decode_offsets,
+        shape.batch,
+        shape.num_heads_q,
+        shape.scheduler_prefill_tasks_per_v,
+        shape.scheduler_tasks_per_v};
   }
 
   template <int Num_SGs>
