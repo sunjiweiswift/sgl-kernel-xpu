@@ -457,7 +457,1720 @@ struct FmhaPrefillRunner {
 // Uses the chunk_prefill kernel/mainloop/epilogue/scheduler implementations.
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-#include "sycl/kernels/flash_attention_v2/kernel/xe_fhma_fwd_kernel.hpp"
+// ChunkPrefill mainloop – merged from chunk_prefill/xe_fmha_fwd_mainloop.hpp
+
+namespace cutlass::fmha::chunk_prefill {
+
+template <int Stages>
+class ChunkPrefillDefault {};  // Default FMHA mainloop, P in registers.
+
+};  // namespace cutlass::fmha::chunk_prefill
+
+namespace cutlass::fmha::chunk_prefill {
+
+using namespace cute;
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <
+    class DispatchPolicy_,
+    bool CausalMask_,
+    bool CachedKV_,
+    bool PagedKV_,
+    class TiledMMAQK_,  // Tiling for Q*K GEMM
+    class TiledMMAPV_,  // Tiling for P*V GEMM
+    int VTiles_,        // # of tiles in V dimension
+    class TensorQ_,     // Global Q/K/V tensors
+    class TensorK_,
+    class TensorV_,
+    class TensorK_cache_,
+    class TensorV_cache_,
+    class TiledCopyQ_ = void,  // Optional TiledCopy for loading Q
+    class TiledCopyK_ = void,  // Optional TiledCopy for loading K
+    class TiledCopyV_ = void,  // Optional TiledCopy for loading V
+    class TiledCopyK_cache_ = void,
+    class TiledCopyV_cache_ = void>  // Optional TiledCopy for loading V_cache
+struct ChunkPrefillMainloop {
+  static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <
+    int Stages,
+    bool CausalMask_,
+    bool CachedKV_,
+    bool PagedKV_,
+    class TiledMMAQK_,
+    class TiledMMAPV_,
+    int VTiles_,
+    class TensorQ_,
+    class TensorK_,
+    class TensorV_,
+    class TensorK_cache_,
+    class TensorV_cache_,
+    class TiledCopyQ_,
+    class TiledCopyK_,
+    class TiledCopyV_,
+    class TiledCopyK_cache_,
+    class TiledCopyV_cache_>
+struct ChunkPrefillMainloop<
+    ChunkPrefillDefault<Stages>,
+    CausalMask_,
+    CachedKV_,
+    PagedKV_,
+    TiledMMAQK_,
+    TiledMMAPV_,
+    VTiles_,
+    TensorQ_,
+    TensorK_,
+    TensorV_,
+    TensorK_cache_,
+    TensorV_cache_,
+    TiledCopyQ_,
+    TiledCopyK_,
+    TiledCopyV_,
+    TiledCopyK_cache_,
+    TiledCopyV_cache_> {
+  //
+  // Type Aliases
+  //
+  using TiledMMAQK = TiledMMAQK_;
+  using TiledMMAPV = TiledMMAPV_;
+  using TileShapeQK = decltype(TiledMMAQK{}.tile_mnk());
+  using TileShapePV = decltype(TiledMMAPV{}.tile_mnk());
+  static constexpr int VTiles = VTiles_;
+  using SubgroupLayoutQK = decltype(TiledMMAQK{}.get_atom_layout_mnk());
+  using SGPerWG = decltype(product(take<1, 4>(shape(typename TiledMMAQK::ThrLayoutVMNK{}))));
+
+  using TensorQ = TensorQ_;
+  using TensorK = TensorK_;
+  using TensorV = TensorV_;
+
+  using TensorQ2D = decltype(TensorQ_{}(append<rank_v<TensorQ_>>(make_coord(_, _), 0)));
+  using TensorK2D = decltype(TensorK_{}(append<rank_v<TensorK_>>(make_coord(_, _), 0)));
+  using TensorV2D = decltype(TensorV_{}(append<rank_v<TensorV_>>(make_coord(_, _), 0)));
+
+  using TiledCopyQ =
+      conditional_t<is_void_v<TiledCopyQ_>, decltype(make_block_2d_copy_A(TiledMMAQK{}, TensorQ2D{})), TiledCopyQ_>;
+  using TiledCopyK =
+      conditional_t<is_void_v<TiledCopyK_>, decltype(make_block_2d_copy_B(TiledMMAQK{}, TensorK2D{})), TiledCopyK_>;
+  using TiledCopyV =
+      conditional_t<is_void_v<TiledCopyV_>, decltype(make_block_2d_copy_B(TiledMMAPV{}, TensorV2D{})), TiledCopyV_>;
+  using TensorK_cache = TensorK_cache_;
+  using TensorV_cache = TensorV_cache_;
+  using TensorK_cache2D = decltype(TensorK_cache_{}(append<rank_v<TensorK_cache_>>(make_coord(_, _), 0)));
+  using TensorV_cache2D = decltype(TensorV_cache_{}(append<rank_v<TensorV_cache_>>(make_coord(_, _), 0)));
+  using TiledCopyK_cache = conditional_t<
+      is_void_v<TiledCopyK_cache_>,
+      decltype(make_block_2d_copy_B(TiledMMAQK{}, TensorK_cache2D{})),
+      TiledCopyK_cache_>;
+  using TiledCopyV_cache = conditional_t<
+      is_void_v<TiledCopyV_cache_>,
+      decltype(make_block_2d_copy_B(TiledMMAPV{}, TensorV_cache2D{})),
+      TiledCopyV_cache_>;
+
+  // TODO: static_asserts on TiledMMAPV here...
+
+  //
+  // Accumulator types
+  //
+  // FragS:    accumulator for Q*K MMA
+  // FragO:    accumulator for P*V MMAs.
+  //           Note: v mode may be split into multiple pieces
+  //             to reduce register pressure.
+  // Frag*Row types are reductions of the corresponding Frag* types
+  //   over rows.
+  //
+  template <typename TiledMMA>
+  using FragC = decltype(TiledMMA{}.get_slice(0).partition_sg_fragment_C(
+      make_identity_tensor(select<0, 1>(TiledMMA{}.tile_mnk()))));
+
+  using FragS = FragC<TiledMMAQK>;
+  using FragSRow = decltype(reduce<1>(FragS{}, sycl::plus<void>{}));
+  using ElementS = typename TiledMMAQK::ValTypeD;
+
+  using SingleFragA = FragC<TiledMMAPV>;                       // (atom val,q',v')
+  using FragA = expand_sg_fragment_t<SingleFragA, 1, VTiles>;  // (atom val,q',v',VV)
+  using FragARow = decltype(reduce<1>(FragA{}, sycl::plus<void>{}));
+  using ElementA = typename TiledMMAPV::ValTypeD;
+
+  static constexpr bool CausalMask = CausalMask_;
+  static constexpr bool CachedKV = CachedKV_;
+  static constexpr bool PagedKV = PagedKV_;
+
+  // User-facing arguments
+  struct Arguments {
+    ElementS const scale;
+    int const* ptr_page_table = nullptr;
+    int page_size = 0;
+    int const* num_pages_per_seq = nullptr;
+  };
+
+  // Kernel-facing parameters
+  using Params = Arguments;
+
+  // SLM data
+  struct SharedStorage {};
+
+  Params params;
+
+  //
+  // Methods
+  //
+
+  ChunkPrefillMainloop(Params const& params_, SharedStorage&) : params(params_) {}
+
+  static constexpr Params to_underlying_arguments(Arguments const& args, void* /* workspace */) {
+    constexpr double kLog2e = 1.4426950408889634074;  // log_2(e)
+    ElementS val = args.scale * static_cast<ElementS>(kLog2e);
+    return Params{val, args.ptr_page_table, args.page_size, args.num_pages_per_seq};
+  }
+
+  CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
+    return true;
+  }
+
+  CUTLASS_DEVICE
+  int get_physical_k_tile(int K, int l_coord, int seq_len_kv_cache) {
+    int next_page_logical_idx = K * get<1>(TileShapeQK{}) / params.page_size;
+    // get<1>(TileShapeQK{}) usually smaller than page_size.
+    // assuming page_size is multiple of get<1>(TileShapeQK{})
+    int tiles_per_page = params.page_size / get<1>(TileShapeQK{});
+    int batch_offset =
+        params.num_pages_per_seq ? params.num_pages_per_seq[l_coord] : l_coord * (seq_len_kv_cache / params.page_size);
+
+    return params.ptr_page_table[batch_offset + next_page_logical_idx] * tiles_per_page + K % tiles_per_page;
+  }
+
+  template <typename QVCoord>
+  CUTLASS_DEVICE void operator()(
+      TensorQ2D const& Q_2D,  // (q,d)
+      TensorK2D const& K_2D,  // (k,d)
+      TensorV2D const& V_2D,  // (d,k)
+      FragA& tArA,            // Output accumulator (q,v)
+      FragARow& tA_max,       // Softmax row-wise max accumulator
+      FragARow& tA_sum,       // Softmax row-wise sum accumulator
+      QVCoord blk_qv,         // WG tile indices: (Q,V)
+      int blk_k0,             // K block range: [K0,K1)
+      int blk_k1,
+      int total_blk,  // Total # of K blocks
+      int thr_id,
+      int seq_len,
+      int seq_len_kv_cache,
+      int l_coord,
+      int full_tile_offset,
+      int discard_seq_coord,
+      TensorK_cache2D const& K_cache_2D = TensorK_cache2D{},
+      TensorV_cache2D const& V_cache_2D = TensorV_cache2D{}) {
+    using namespace sycl::ext::oneapi::this_work_item;
+
+    // Short dimension names:
+    //    q = sequence len dimension for Q
+    //    k = sequence len dimension for K
+    //    d = head size dimension for K/Q
+    //    v = head size dimension for V
+    //   VV = MMA tile indices for V
+    // Capital letters (Q, K, ...) refer to WG block indices.
+    // Primed letters (q', k', ...) refer to atom block indices.
+
+    auto tile_shape_v = make_shape(get<1>(TileShapePV{}) * C<VTiles>{}, get<2>(TileShapePV{}));
+
+    /* Create proxy coordinate tensors for Q/K/P/V */
+    Tensor cQ = make_identity_tensor(Q_2D.shape());               // (q,d)
+    Tensor cK = make_identity_tensor(K_2D.shape());               // (k,d)
+    Tensor cV = make_identity_tensor(V_2D.shape());               // (v,k)
+    Tensor cK_cache = make_identity_tensor(K_cache_2D.shape());   // (k,d)
+    Tensor cV_cache = make_identity_tensor(V_cache_2D.shape());   // (v,k)
+    Tensor cP = make_identity_tensor(take<0, 2>(TileShapeQK{}));  // (q,k)
+
+    /* Partition global tensors into workgroup tiles */
+    Tensor gQ = local_tile(cQ, TileShapeQK{}, append(blk_qv, _), Step<_1, X, _1>{});          // (q,d,D)
+    Tensor gK = local_tile(cK, TileShapeQK{}, make_coord(_, _, _), Step<X, _1, _1>{});        // (k,d,K,D)
+    Tensor gV = local_tile(cV, tile_shape_v, make_coord(get<1>(blk_qv), _));                  // (v,k,K)
+    Tensor gV_split = local_tile(gV, TileShapePV{}, make_coord(_, _, 0), Step<X, _1, _1>{});  // (v,k,VV,K)
+
+    Tensor gK_cache = local_tile(cK_cache, TileShapeQK{}, make_coord(_, _, _), Step<X, _1, _1>{});        // (k,d,K,D)
+    Tensor gV_cache = local_tile(cV_cache, tile_shape_v, make_coord(get<1>(blk_qv), _));                  // (v,k,K)
+    Tensor gV_cache_split = local_tile(gV_cache, TileShapePV{}, make_coord(_, _, 0), Step<X, _1, _1>{});  // (v,k,VV,K)
+
+    /* Create global -> register copies */
+    TiledCopyQ copy_q{Q_2D};
+    TiledCopyK copy_k{K_2D};
+    TiledCopyV copy_v{V_2D};
+    TiledCopyK_cache copy_k_cache{K_cache_2D};
+    TiledCopyV_cache copy_v_cache{V_cache_2D};
+
+    /* Create MMAs */
+    TiledMMAQK mma_qk{};
+    TiledMMAPV mma_pv{};
+
+    /* Slice TiledCopy/TiledMMA operations down to to work-item level */
+    auto thr_copy_q = copy_q.get_slice(thr_id);
+    auto thr_copy_k = copy_k.get_slice(thr_id);
+    auto thr_copy_v = copy_v.get_slice(thr_id);
+    auto thr_copy_k_cache = copy_k_cache.get_slice(thr_id);
+    auto thr_copy_v_cache = copy_v_cache.get_slice(thr_id);
+    auto thr_mma_qk = mma_qk.get_slice(thr_id);
+    auto thr_mma_pv = mma_pv.get_slice(thr_id);
+
+    /* Partition coordinate tensors for copy */
+    auto tQgQ = thr_copy_q.partition_S(gQ);        // (atom_val,q',d',D)
+    auto tKgK = thr_copy_k.partition_S(gK);        // (atom_val,k',d',K,D)
+    auto tVgV = thr_copy_v.partition_S(gV_split);  // (atom_val,v',k',VV,K)
+    auto tKgK_cache = thr_copy_k_cache.partition_S(gK_cache);
+    auto tVgV_cache = thr_copy_v_cache.partition_S(gV_cache_split);
+
+    /* Create register fragments for MMA and copies */
+    auto tQrQ = thr_copy_q.partition_sg_fragment_D(gQ(_, _, 0));
+    auto tSrQ = thr_mma_qk.partition_sg_fragment_A(gQ(_, _, 0));
+
+    auto tKrK = thr_copy_k.partition_sg_fragment_D(gK(_, _, 0, 0));
+    auto tSrK = thr_mma_qk.partition_sg_fragment_B(gK(_, _, 0, 0));
+
+    auto tSrS = thr_mma_qk.partition_sg_fragment_C(cP);
+    auto tArP = thr_mma_pv.partition_sg_fragment_A(cP);
+
+    auto tVrV = thr_copy_v.partition_sg_fragment_D(gV_split(_, _, 0, 0));
+    auto tArV = thr_mma_pv.partition_sg_fragment_B(gV_split(_, _, 0, 0));
+
+    /* Create TiledCopy objects for prefetches */
+    auto prefetch_q = make_block_2d_prefetch(copy_q);
+    auto prefetch_k = make_block_2d_prefetch(copy_k);
+    auto prefetch_v = make_block_2d_prefetch(copy_v);
+    auto prefetch_k_cache = make_block_2d_prefetch(copy_k_cache);
+    auto prefetch_v_cache = make_block_2d_prefetch(copy_v_cache);
+
+    /* Partition global tensors for prefetch */
+    auto pQgQ = prefetch_q.get_slice(thr_id).partition_S(gQ);
+    auto pKgK = prefetch_k.get_slice(thr_id).partition_S(gK);
+    auto pVgV = prefetch_v.get_slice(thr_id).partition_S(gV_split);
+    auto pKgK_cache = prefetch_k_cache.get_slice(thr_id).partition_S(gK_cache);
+    auto pVgV_cache = prefetch_v_cache.get_slice(thr_id).partition_S(gV_cache_split);
+
+    // ------
+    // Kernel
+    // ------
+
+    /* Initialization steps for first block: Q/K prefetch, O init */
+    /* TODO: limit D prefetch for large head size, and reorder K prefetches */
+    int kblocks_cache = ceil_div(seq_len_kv_cache, get<1>(TileShapeQK{}));
+    for (int D = 0; D < size<3>(pQgQ); D++) {
+      prefetch(prefetch_q, pQgQ(_, _, _, D));
+    }
+    for (int D = 0; D < size<4>(pKgK); D++) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int K = 0; K < Stages; K++) {
+        if (K < kblocks_cache) {
+          if constexpr (PagedKV) {
+            int physical_K_tile = get_physical_k_tile(K, l_coord, seq_len_kv_cache);
+            prefetch(prefetch_k_cache, pKgK_cache(_, _, _, physical_K_tile, D));
+          } else {
+            prefetch(prefetch_k_cache, pKgK_cache(_, _, _, K, D));
+          }
+        } else {
+          prefetch(prefetch_k, pKgK(_, _, _, K - kblocks_cache, D));
+        }
+      }
+    }
+    if (blk_k0 == 0) {
+      clear(tArA);
+      fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
+      clear(tA_sum);
+    }
+
+    /* Check if */
+    bool check_remainder_k = (seq_len % get<1>(TileShapeQK{}) != 0);
+
+    /* Main loop body */
+    auto mainloop_body = [&](auto cached_k,
+                             int K,
+                             auto& copy_k_cur,
+                             auto& copy_v_cur,
+                             auto& prefetch_v_cur,
+                             auto& tKgK_cur,
+                             auto& tVgV_cur,
+                             auto& pVgV_cur) {
+      /* Split barrier to keep threads together */
+      barrier_arrive(ScopeWorkgroup);
+      constexpr bool is_cache = decltype(cached_k)::value;
+
+      int k_idx;
+      if constexpr (is_cache) {
+        k_idx = K;
+        if constexpr (PagedKV) {
+          k_idx = get_physical_k_tile(K, l_coord, seq_len_kv_cache);
+        }
+      } else {
+        k_idx = K - kblocks_cache;
+      }
+
+      /* GEMM 1: S = K * Q */
+      clear(tSrS);
+      CUTLASS_PRAGMA_UNROLL
+      for (int D = 0; D < size<4>(tKgK); D++) {
+        copy(copy_q, tQgQ(_, _, _, D), tQrQ);
+        copy(copy_k_cur, tKgK_cur(_, _, _, k_idx, D), tKrK);
+        reorder(tQrQ, tSrQ);
+        reorder(tKrK, tSrK);
+
+        cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
+      }
+
+      /* V prefetch for GEMM 2 */
+      CUTLASS_PRAGMA_UNROLL
+      for (int VV = 0; VV < VTiles; VV++) {
+        prefetch(prefetch_v_cur, pVgV_cur(_, _, _, VV, k_idx));
+      }
+      /* Causal masking - only in non-cache mode */
+      if constexpr (!is_cache && CausalMask) {
+        if (K == total_blk - 1) {
+          // Need to get global col and row indices to mask the elements
+          Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
+          Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
+          auto cS_thread = thr_mma_qk.partition_C(gP);
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); ++i) {
+            int row_idx = get<0>(cS_thread(i));
+            int col_idx = get<1>(cS_thread(i));
+            if (col_idx - seq_len_kv_cache - full_tile_offset > row_idx - discard_seq_coord) {
+              tSrS(i) = ElementS(-INFINITY);
+            }
+          }
+        }
+      }
+      /* k masking for remainder tiles */
+      if constexpr (!is_cache) {
+        if (check_remainder_k && K == total_blk - 1) {
+          FragSRow k_rem_mask;
+          int k_val = get<0>(tKgK_cur(0, 0, 0, k_idx, 0)) + kblocks_cache * get<1>(TileShapeQK{});
+          int k = k_val + get_sub_group().get_local_id()[0];
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < k_rem_mask.size(); i++, k += intel::sg_size) {
+            k_rem_mask(i) = (k < seq_len) ? ElementS(sycl::nan(0u)) : ElementS(-INFINITY);
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); i++) {
+            tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(k_rem_mask, tSrS, i));
+          }
+        }
+      }
+
+      /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
+      auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum);
+      reorder(tSrS, tArP);
+
+      /* GEMM 2: A += P * V, split in v dimension.
+        tArA rescaling is fused to per-VTile */
+      CUTLASS_PRAGMA_UNROLL
+      for (int VV = 0; VV < VTiles; VV++) {
+        copy(copy_v_cur, tVgV_cur(_, _, _, VV, k_idx), tVrV);
+        reorder(tVrV, tArV);
+        if (K != blk_k0) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tArA.size() / VTiles; i++)
+            tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
+        }
+
+        cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
+      }
+
+      /* K prefetch */
+      int K_next = K + Stages;
+      for (int D = 0; D < size<4>(pKgK); D++) {
+        if constexpr (is_cache) {
+          bool is_cache_next = K_next < kblocks_cache;
+          int physical_K_next = K_next;
+          if constexpr (PagedKV) {
+            if (is_cache_next) {
+              physical_K_next = get_physical_k_tile(K_next, l_coord, seq_len_kv_cache);
+            }
+          }
+          if (is_cache_next) {
+            prefetch(prefetch_k_cache, pKgK_cache(_, _, _, physical_K_next, D));
+          } else {
+            prefetch(prefetch_k, pKgK(_, _, _, K_next - kblocks_cache, D));
+          }
+        } else {
+          prefetch(prefetch_k, pKgK(_, _, _, K_next - kblocks_cache, D));
+        }
+      }
+      barrier_wait(ScopeWorkgroup);
+    };
+
+    /* Main loop, blocked in k. */
+    if constexpr (CachedKV) {
+      for (int K = blk_k0; K < kblocks_cache; K++) {
+        mainloop_body(
+            std::bool_constant<true>{},
+            K,
+            copy_k_cache,
+            copy_v_cache,
+            prefetch_v_cache,
+            tKgK_cache,
+            tVgV_cache,
+            pVgV_cache);
+      }
+    }
+
+    for (int K = (blk_k0 > kblocks_cache ? blk_k0 : kblocks_cache); K < blk_k1; K++) {
+      mainloop_body(std::bool_constant<false>{}, K, copy_k, copy_v, prefetch_v, tKgK, tVgV, pVgV);
+    }
+  }
+
+  // Single step of blocked softmax.
+  CUTLASS_DEVICE
+  FragSRow softmax(
+      bool first_block,    // First softmax block?
+      FragS& tS,           // Softmax src/dst block
+      FragSRow& tS_max,    // Softmax row-wise max accumulator
+      FragSRow& tS_sum) {  // Softmax row-wise sum accumulator
+    /* Compute row-wise maxima for this block */
+    auto tS_bmax = reduce<1>(tS, sycl::maximum{});
+
+    FragSRow rescale;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tS_max.size(); i++) {
+      ElementS new_max = sycl::max(tS_max(i), params.scale * tS_bmax(i));
+      rescale(i) = sycl::native::exp2(tS_max(i) - new_max);
+      tS_max(i) = new_max;
+    }
+
+    /* Scale S and subtract maxima, then exponentiate */
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tS.size(); i++)
+      tS(i) = sycl::native::exp2(params.scale * tS(i) - broadcast<0>(tS_max, tS, i));
+
+    /* Rescale existing S sums */
+    if (!first_block) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tS_sum.size(); i++) {
+        tS_sum(i) *= rescale(i);
+      }
+    }
+
+    /* Update sums */
+    auto tS_bsum = reduce<1>(tS, sycl::plus<void>{});
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tS_sum.size(); i++)
+      tS_sum(i) += tS_bsum(i);
+
+    return rescale;
+  }
+};
+
+template <typename SGLayoutQK>
+CUTLASS_HOST_DEVICE constexpr auto chunk_prefill_get_sg_layout_pv(SGLayoutQK const&) {
+  return make_layout(get<0>(SGLayoutQK{}), Layout<_1, _0>{}, get<1>(SGLayoutQK{}));
+}
+
+// Get a P*V TiledMMA given K*Q tile size and SG configuration, for mainloops
+//   not supporting S data interchange among subgroups (e.g. ChunkPrefillDefault).
+template <typename MMAOp, typename WGTileQK, typename SGLayoutQK, typename TileV>
+CUTLASS_HOST_DEVICE constexpr auto
+chunk_prefill_get_tiled_mma_pv(MMAOp const&, WGTileQK const& wg_tile_qk, SGLayoutQK const& sg_layout_qk, TileV const&) {
+  using TileQ = decltype(get<0>(wg_tile_qk));
+  using TileK = decltype(get<1>(wg_tile_qk));
+
+  using WGTilePV = Shape<TileQ, TileV, TileK>;
+  using SGLayoutPV = decltype(chunk_prefill_get_sg_layout_pv(sg_layout_qk));
+
+  static_assert(size(SGLayoutPV{}) == size(SGLayoutQK{}), "Q*K cannot be parallelized in the head size dimension");
+
+  return TiledMMAHelper<MMAOp, WGTilePV, SGLayoutPV>{};
+}
+
+}  // namespace cutlass::fmha::chunk_prefill
+// ChunkPrefill epilogue – merged from chunk_prefill/xe_fmha_fwd_epilogue.hpp
+
+namespace cutlass::fmha::chunk_prefill {
+
+using namespace cute;
+
+template <
+    class CollectiveMainloop,  // Attention mainloop
+    class TileShapeO_,         // Shape of output tile, may be larger than P*V GEMM
+    class TensorO_,            // 2D slice of global output tensor
+    class TiledCopyO_ = void>  // Optional TiledCopy for loading O
+class ChunkPrefillEpilogue {
+ public:
+  //
+  // Type Aliases
+  //
+  using TiledMMAPV = typename CollectiveMainloop::TiledMMAPV;
+  using TileShapePV = decltype(TiledMMAPV{}.tile_mnk());
+  using TileShapeO = TileShapeO_;
+  using SGPerWG = decltype(product(take<1, 4>(shape(typename TiledMMAPV::ThrLayoutVMNK{}))));
+
+  using TensorO = TensorO_;
+  using TensorO2D = decltype(TensorO_{}(append<rank_v<TensorO_>>(make_coord(_, _), 0)));
+  using ElementO = typename TensorO_::value_type;
+
+  using FragA = typename CollectiveMainloop::FragA;
+  using FragARow = typename CollectiveMainloop::FragARow;
+  using ElementA = typename FragA::value_type;
+
+  // Split k-reduced tiles between participating subgroups.
+  // Assumption: the A tile is contiguous.
+  using ReduceK = decltype(size<3>(typename TiledMMAPV::ThrLayoutVMNK{}));
+
+  static auto reduce_sg_v_helper() {
+    constexpr auto v_total_sg = get<1>(SGTileShapeA{}) / intel::_SGSize{};
+    constexpr auto v_avail_sg = ReduceK{} / ReduceSGQ{};
+    return Int < (v_total_sg > v_avail_sg) ? cute::gcd(v_total_sg, v_avail_sg) : v_total_sg > {};
+  }
+
+  using SGTileShapeA = decltype(atuple_coshape(FragA{}.tv_layout()));
+  using ReduceSGQ = decltype(cute::gcd(get<0>(SGTileShapeA{}), ReduceK{}));
+  using ReduceSGV = decltype(reduce_sg_v_helper());
+  using ReduceSGLayout = decltype(make_identity_layout(Shape<ReduceSGQ, ReduceSGV>{}));
+
+  using SGTileShapeO = decltype(shape_div(take<0, 2>(SGTileShapeA{}), shape(ReduceSGLayout{})));
+
+  using ReduceFragA =
+      decltype(make_subgroup_tensor<ElementA>(make_layout(select<1, 0>(SGTileShapeO{}), Stride<E<1>, E<0>>{})));
+  using ReduceFragARow = decltype(reduce<1>(ReduceFragA{}, sycl::plus<void>{}));
+
+  static auto default_tiled_copy_O_helper() {
+    if constexpr (ReduceK{} == _1{})
+      return make_block_2d_copy_D(TiledMMAPV{}, TensorO2D{});
+    else
+      return make_block_2d_copy_D_subtiled(TiledMMAPV{}, ReduceFragA{}.tv_layout(), ReduceSGLayout{}, TensorO2D{});
+  }
+
+  using DefaultTiledCopyO = decltype(default_tiled_copy_O_helper());
+  using TiledCopyO = conditional_t<is_void_v<TiledCopyO_>, DefaultTiledCopyO, TiledCopyO_>;
+
+  // Stateless design -- no arguments or parameters.
+  struct Arguments {};
+  struct Params {};
+
+  // Shared memory storage
+  // Note sum/max tiles are padded to 16 elements, due to limitations in CuTe block load infrastructure.
+  using AlignedSGTileA_Q = C<((size<0>(SGTileShapeA{}) + intel::sg_size - 1) / intel::sg_size) * intel::sg_size>;
+
+  struct SharedStorageNone {};
+  struct SharedStorageReduceK {
+    cute::array<ElementA, size(SGTileShapeA{}) * SGPerWG{}> a_data;
+    cute::array<ElementA, AlignedSGTileA_Q{} * SGPerWG{}> a_sum_data, a_max_data;
+  };
+
+  using SharedStorage = conditional_t<(ReduceK{} > _1{}), SharedStorageReduceK, SharedStorageNone>;
+
+ private:
+  SharedStorage& shared;
+
+ public:
+  static constexpr Params to_underlying_arguments(Arguments const& args, void* /* workspace */) {
+    return {};
+  }
+
+  CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
+    return true;
+  }
+
+  CUTLASS_HOST_DEVICE
+  ChunkPrefillEpilogue(Params const&, SharedStorage& shared_) : shared(shared_) {}
+
+  template <typename QVCoord>
+  CUTLASS_DEVICE void operator()(
+      TensorO2D const& O,  // Global O tensor: (q,v)
+      FragA& tArA,         // O accumulator:   (q,v)
+      FragARow& tA_max,    // Softmax row-wise max accumulator
+      FragARow& tA_sum,    // Softmax row-wise sum accumulator
+      QVCoord blk_qv,      // WG tile indices: (q,v)
+      int thr_id) {        // Work-item ID
+
+    using namespace cute;
+    using ElementA = typename FragA::element_type;
+
+    // Reduce k-blocks of A and A_sum across WG, if needed.
+    auto [rA, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
+
+    /* Some subgroups may not have any work to do; if so, quit early. */
+    if (!active) return;
+
+    /* Complete softmax, dividing out sums. */
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < rA_sum.size(); i++)
+      rA_sum(i) = ElementA(1) / rA_sum(i);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < rA.size(); i++)
+      rA(i) *= broadcast<0>(rA_sum, rA, i);
+
+    /* Tile output */
+    Tensor cO = make_identity_tensor(O.shape());       // (q,v)
+    Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);  // (q,v)
+
+    /* Prepare slices */
+    TiledCopyO copy_o{O};
+    auto thr_copy_o = copy_o.get_slice(thr_id);
+
+    auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
+    auto tOgO = thr_copy_o.partition_D(gO);
+
+    /* Reorder tile and write out */
+    reorder(rA, tOrO);
+    copy(copy_o, tOrO, tOgO);
+  }
+
+  // Reduce k-blocks of A and A_sum across WG, if needed.
+  // Note that each k block has its own scale factor based on A_max,
+  //   so A/A_sum contributions need to be rescaled to match.
+  template <typename FragA, typename FragARow>
+  CUTLASS_DEVICE decltype(auto) reduce_A(
+      FragA& tArA,       // O accumulator:   (q,v)
+      FragARow& tA_max,  // Softmax row-wise max accumulator
+      FragARow& tA_sum,  // Softmax row-wise sum accumulator
+      int thr_id) {      // Work-item ID
+
+    using namespace sycl::ext::oneapi::this_work_item;
+
+    if constexpr (ReduceK{} == _1{}) {
+      return std::make_tuple(tArA, tA_sum, true);
+    } else {
+      /* Identify A tile ID and k block for this subgroup. */
+      auto thr_vak = group<1, 3>(TiledMMAPV{}.get_thr_layout_vmnk()).get_flat_coord(assert_uniform(thr_id));
+      auto a_tile = get<1>(thr_vak);
+      auto k_blk = get<2>(thr_vak);
+
+      /* Set up SLM tensors and partition A tiles among participating subgroups */
+      auto shape_A = append(append(SGTileShapeA{}, ReduceK{}), SGPerWG{} / ReduceK{});
+      auto shape_A_row = make_shape(get<0>(SGTileShapeO{}), shape(ReduceSGLayout{}), ReduceK{}, SGPerWG{} / ReduceK{});
+
+      /* Physical layouts, with sub-tile modes broken out */
+      auto sA_layout = group<2, 4>(flat_divide(make_ordered_layout(shape_A, Step<_1, _0, _2, _3>{}), SGTileShapeO{}));
+      auto sA_row_stride =
+          make_stride(_1{}, make_stride(get<0>(shape_A_row), _0{}), AlignedSGTileA_Q{}, AlignedSGTileA_Q{} * ReduceK{});
+      auto sA_row_layout = make_layout(shape_A_row, sA_row_stride);
+
+      /* Coordinate layouts, with sub-tile modes broken out */
+      auto basis2 = make_basis_like(SGTileShapeO{});
+      auto sA_coords = make_layout(
+          append(SGTileShapeO{}, shape(ReduceSGLayout{})), append(basis2, product_each(zip(SGTileShapeO{}, basis2))));
+
+      auto sA = make_tensor(make_smem_ptr<ElementA>(&shared.a_data), sA_layout);  // (q,v,rblk_dst,rblk_src,a_tile)
+      auto sA_max =
+          make_tensor(make_smem_ptr<ElementA>(&shared.a_max_data), sA_row_layout);  // (q,rblk_dst,rblk_src,a_tile)
+      auto sA_sum =
+          make_tensor(make_smem_ptr<ElementA>(&shared.a_sum_data), sA_row_layout);  // (q,rblk_dst,rblk_src,a_tile)
+
+      /* Write my contributions to SLM. */
+      copy_block_r2s(tA_max, sA_max(_, _, k_blk, a_tile));
+      barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
+      copy_block_r2s(tA_sum, sA_sum(_, _, k_blk, a_tile));
+      copy_block_r2s(tArA, sA(_, _, _, k_blk, a_tile), sA_coords);
+
+      bool active = (k_blk < size(ReduceSGLayout{})) || (ReduceK{} == size(ReduceSGLayout{}));  // help compiler out
+
+      /* Wait for maxima to be available, signal other data available */
+      barrier_wait(ScopeWorkgroup, SemanticsAcquire | SemanticsWGMemory);
+      barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
+
+      ReduceFragA rA;
+      ReduceFragARow rA_sum, rA_max, rA_kmax[ReduceK{}];
+
+      if (active) {
+        /* Read A_max back from SLM and reduce. */
+        CUTLASS_PRAGMA_UNROLL
+        for (int kr = 0; kr < ReduceK{}; kr++) {
+          copy_block_s2r(sA_max(_, k_blk, kr, a_tile), rA_kmax[kr]);
+        }
+
+        rA_max = rA_kmax[0];
+        for (int kr = 1; kr < ReduceK{}; kr++)
+          cute::transform(rA_max, rA_kmax[kr], rA_max, cute::max_fn{});
+
+        /* Calculate scale factors for aligning per-block maxima. */
+        for (int kr = 0; kr < ReduceK{}; kr++) {
+          cute::transform(
+              rA_max, rA_kmax[kr], rA_kmax[kr], [](auto gmax, auto kmax) { return sycl::native::exp2(kmax - gmax); });
+        }
+      }
+
+      /* Wait for A/A_sum data to be available */
+      barrier_wait(ScopeWorkgroup, SemanticsAcquire | SemanticsWGMemory);
+
+      if (active) {
+        /* Read A/A_sum back from SLM, align scaling to new maxima, and reduce. */
+        clear(rA_sum);
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int kr = 0; kr < ReduceK{}; kr++) {
+          ReduceFragARow rA_sum_read;
+          copy_block_s2r(sA_sum(_, k_blk, kr, a_tile), rA_sum_read);
+
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < rA_sum_read.size(); i++) {
+            rA_sum(i) += rA_sum_read(i) * rA_kmax[kr](i);
+          }
+        }
+
+        clear(rA);
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int kr = 0; kr < ReduceK{}; kr++) {
+          ReduceFragA rA_read;
+          copy_block_s2r(sA(_, _, k_blk, kr, a_tile), sA_coords(_, _, 0), rA_read);
+
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < rA_read.size(); i++) {
+            rA(i) += rA_read(i) * broadcast<0>(rA_kmax[kr], rA, i);
+          }
+        }
+      }
+      return std::make_tuple(rA, rA_sum, active);
+    }
+  }
+};
+
+}  // namespace cutlass::fmha::chunk_prefill
+// ChunkPrefill kernel – merged from chunk_prefill/xe_fmha_fwd_kernel.hpp
+
+namespace cutlass::fmha::chunk_prefill {
+
+using namespace cute;
+
+///////////////////////////////////////////////////////////////////////////////
+template <bool IsVarLen_ = false>
+struct ChunkPrefillProblemShape {
+  using SeqLenType = cute::conditional_t<IsVarLen_, cutlass::fmha::collective::VariableLength, int>;
+  int batch;
+  int num_heads_q, num_heads_kv;
+  SeqLenType seq_len_qo, seq_len_kv, seq_len_kv_cache;
+  int head_size_qk, head_size_vo;
+  int scheduler_num_tasks = 0;
+  int const* scheduler_prefill_offsets = nullptr;
+  int const* scheduler_decode_offsets = nullptr;
+  int scheduler_prefill_tasks_per_v = 0;
+  int scheduler_tasks_per_v = 0;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+
+template <class ProblemShape_, class CollectiveMainloop_, class CollectiveEpilogue_, class TileScheduler_>
+class ChunkPrefillFwdKernel {
+ public:
+  //
+  // Type Aliases
+  //
+  using ProblemShape = ProblemShape_;
+  using VariableLength = cutlass::fmha::collective::VariableLength;
+  static constexpr bool is_var_len = cutlass::fmha::collective::is_variable_length_v<typename ProblemShape::SeqLenType>;
+  // Mainloop derived types
+  using CollectiveMainloop = CollectiveMainloop_;
+  using MainloopArguments = typename CollectiveMainloop::Arguments;
+  using MainloopParams = typename CollectiveMainloop::Params;
+
+  using TiledMMAQK = typename CollectiveMainloop::TiledMMAQK;
+  using TiledMMAPV = typename CollectiveMainloop::TiledMMAPV;
+  using TileShapeQK = typename CollectiveMainloop::TileShapeQK;
+  using TileShapePV = typename CollectiveMainloop::TileShapePV;
+  using SubgroupLayoutQK = typename CollectiveMainloop::SubgroupLayoutQK;
+  using ElementQ = typename CollectiveMainloop::TensorQ::element_type;
+  using ElementK = typename CollectiveMainloop::TensorK::element_type;
+  using ElementV = typename CollectiveMainloop::TensorV::element_type;
+
+  using StrideQ = decltype(stride(typename CollectiveMainloop::TensorQ{}));
+  using StrideK = decltype(stride(typename CollectiveMainloop::TensorK{}));
+  using StrideV = decltype(stride(typename CollectiveMainloop::TensorV{}));
+
+  using SGPerWG = typename CollectiveMainloop::SGPerWG;
+
+  using FragA = typename CollectiveMainloop::FragA;
+  using FragARow = typename CollectiveMainloop::FragARow;
+
+  // Tile scheduler derived types
+  using TileScheduler = TileScheduler_;
+  using TileSchedulerParams = typename TileScheduler::Params;
+
+  // Epilogue derived types
+  using CollectiveEpilogue = CollectiveEpilogue_;
+  using EpilogueArguments = typename CollectiveEpilogue::Arguments;
+  using EpilogueParams = typename CollectiveEpilogue::Params;
+
+  using TileShapeO = typename CollectiveEpilogue::TileShapeO;
+  using ElementO = typename CollectiveEpilogue::TensorO::element_type;
+  using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
+
+  // Kernel level shared memory storage
+  using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
+  using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
+  union SharedStorage {
+    MainloopSharedStorage mainloop;
+    EpilogueSharedStorage epilogue;
+  };
+
+  static constexpr int SharedStorageSize = is_empty_v<SharedStorage> ? size_t(0) : sizeof(SharedStorage);
+
+  // Device side arguments
+  struct KernelArguments {
+    ProblemShape shape;
+    const ElementQ* Q;
+    StrideQ dQ;
+    const ElementK* K;
+    StrideK dK;
+    const ElementV* V;
+    StrideV dV;
+    ElementO* O;
+    StrideO dO;
+    const ElementK* K_cache;
+    StrideK dK_cache{};
+    const ElementV* V_cache;
+    StrideV dV_cache{};
+  };
+  using KernelParams = KernelArguments;
+
+  struct Arguments {
+    KernelArguments kernel{};
+    MainloopArguments mainloop{};
+    EpilogueArguments epilogue{};
+    KernelHardwareInfo hw_info{};
+  };
+
+  // Kernel entry point API
+  struct Params {
+    KernelParams kernel;
+    MainloopParams mainloop;
+    EpilogueParams epilogue;
+    TileSchedulerParams scheduler;
+  };
+
+  //
+  // Methods
+  //
+
+  static Params to_underlying_arguments(Arguments const& args, void* workspace) {
+    return {
+        args.kernel,
+        CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
+        CollectiveEpilogue::to_underlying_arguments(args.epilogue, workspace),
+        TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{})};
+  }
+
+  static bool can_implement(Arguments const& args) {
+    return CollectiveMainloop::can_implement(args.mainloop) && CollectiveEpilogue::can_implement(args.epilogue);
+  }
+
+  static int get_workspace_size(Arguments const& args) {
+    return 0;
+  }
+
+  static cutlass::Status initialize_workspace(
+      Arguments const& args,
+      void* workspace = nullptr,
+      cudaStream_t stream = nullptr,
+      CudaHostAdapter* cuda_adapter = nullptr) {
+    return Status::kSuccess;
+  }
+
+  static dim3 get_grid_shape(Params const& params) {
+    return TileScheduler::template get_grid_shape<SGPerWG::value>(params.scheduler);
+  }
+
+  static dim3 get_block_shape() {
+    return dim3(SGPerWG::value * intel::sg_size, 1, 1);
+  }
+
+  CUTLASS_DEVICE
+  Shape<int, int, int> get_sequence_length_shape(ProblemShape const& problem_shape, int const& batch) {
+    if constexpr (is_var_len) {
+      return cutlass::fmha::collective::apply_variable_length(
+          Shape<VariableLength, VariableLength, VariableLength>{
+              problem_shape.seq_len_qo, problem_shape.seq_len_kv, problem_shape.seq_len_kv_cache},
+          batch);
+    } else {
+      return Shape<int, int, int>{problem_shape.seq_len_qo, problem_shape.seq_len_kv, problem_shape.seq_len_kv_cache};
+    }
+  }
+
+  CUTLASS_DEVICE
+  void operator()(Params const& params, char* smem_buf) {
+    using namespace sycl::ext::oneapi::this_work_item;
+
+    SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
+
+    auto& p = params.kernel;
+    ProblemShape const& s = p.shape;
+    int head_group_q = s.num_heads_q / s.num_heads_kv;
+
+    int thr_id = int(ThreadIdxX());
+    int sub_group_id = thr_id / intel::sg_size;
+    int q_sg_tile = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})));
+
+    auto cS = make_identity_tensor(take<0, 2>(TiledMMAQK{}.tile_mnk()));
+    auto tScS = TiledMMAQK{}.get_slice(thr_id).partition_C(cS);
+    auto q_offset_wi = get<0>(tScS(0));
+    auto q_offset_sg = group_broadcast(sycl::ext::oneapi::this_work_item::get_sub_group(), q_offset_wi, 0);
+
+    TileScheduler tile_scheduler{params.scheduler};
+
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (; tile_scheduler.is_valid(); ++tile_scheduler) {
+      auto [blk_q, blk_v, head_q, idx_b] = tile_scheduler.get_block_coord();  // (Q,V,h,b)
+      auto blk_qv = make_coord(blk_q, blk_v);
+      int head = head_q / head_group_q;
+
+      auto sequence_length_shape = get_sequence_length_shape(s, idx_b);
+      auto [seq_len_qo, seq_len_kv, seq_len_kv_cache] = sequence_length_shape;
+      if (blk_q * get<0>(TileShapeQK{}) >= seq_len_qo) continue;
+
+      auto offset = cute::min(seq_len_qo, seq_len_kv);
+      auto discard_seq_coord = seq_len_qo - offset;
+      auto full_tile_offset = seq_len_kv - offset;
+      int seq_coord = cute::min(seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
+
+      if (CollectiveMainloop::CausalMask && seq_coord < discard_seq_coord) continue;
+      const int seq_len_new = CollectiveMainloop::CausalMask
+                                  ? full_tile_offset + cute::min(seq_len_kv, seq_coord - discard_seq_coord) + q_sg_tile
+                                  : seq_len_kv;
+      const int seq_len = seq_len_new + seq_len_kv_cache;
+      const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
+
+      int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
+      int offset_k_cache = 0, offset_v_cache = 0;
+      if constexpr (is_var_len) {
+        auto qo_cumulative = s.seq_len_qo.cumulative_length;
+        auto kv_cumulative = s.seq_len_kv.cumulative_length;
+        offset_q = s.num_heads_q * s.head_size_qk * qo_cumulative[idx_b];
+        offset_k = s.num_heads_kv * s.head_size_qk * kv_cumulative[idx_b];
+        offset_v = s.num_heads_kv * s.head_size_vo * kv_cumulative[idx_b];
+        offset_o = s.num_heads_q * s.head_size_vo * qo_cumulative[idx_b];
+        if (s.seq_len_kv_cache.cumulative_length) {
+          auto kv_cumulative_cache = s.seq_len_kv_cache.cumulative_length;
+          offset_k_cache = s.num_heads_kv * s.head_size_qk * kv_cumulative_cache[idx_b];
+          offset_v_cache = s.num_heads_kv * s.head_size_vo * kv_cumulative_cache[idx_b];
+        }
+      }
+
+      auto batch_dim = is_var_len ? 1 : s.batch;
+      auto shape_Q = make_shape(seq_len_qo, s.head_size_qk, s.num_heads_q, batch_dim);
+      auto shape_K = make_shape(seq_len_kv, s.head_size_qk, s.num_heads_kv, batch_dim);
+      auto shape_V = make_shape(s.head_size_vo, seq_len_kv, s.num_heads_kv, batch_dim);
+      auto shape_O = make_shape(seq_len_qo, s.head_size_vo, s.num_heads_q, batch_dim);
+
+      auto shape_K_cache = make_shape(seq_len_kv_cache, s.head_size_qk, s.num_heads_kv, batch_dim);
+      auto shape_V_cache = make_shape(s.head_size_vo, seq_len_kv_cache, s.num_heads_kv, batch_dim);
+
+      auto dcQ = const_cast<ElementQ*>(p.Q + offset_q);
+      auto dcK = const_cast<ElementK*>(p.K + offset_k);
+      auto dcV = const_cast<ElementV*>(p.V + offset_v);
+      auto dcK_cache = const_cast<ElementK*>(p.K_cache + offset_k_cache);
+      auto dcV_cache = const_cast<ElementV*>(p.V_cache + offset_v_cache);
+      auto ptrO = p.O + offset_o;
+
+      auto stride_q = is_var_len ? cutlass::make_cute_packed_stride(StrideQ{}, shape_Q) : p.dQ;
+      auto stride_k = is_var_len ? cutlass::make_cute_packed_stride(StrideK{}, shape_K) : p.dK;
+      auto stride_v = is_var_len ? cutlass::make_cute_packed_stride(StrideV{}, shape_V) : p.dV;
+      auto stride_o = is_var_len ? cutlass::make_cute_packed_stride(StrideO{}, shape_O) : p.dO;
+      auto stride_k_cache = is_var_len ? cutlass::make_cute_packed_stride(StrideK{}, shape_K_cache) : p.dK_cache;
+      auto stride_v_cache = is_var_len ? cutlass::make_cute_packed_stride(StrideV{}, shape_V_cache) : p.dV_cache;
+
+      Tensor Q = make_tensor(make_gmem_ptr(dcQ), make_layout(shape_Q, stride_q));
+      Tensor K = make_tensor(make_gmem_ptr(dcK), make_layout(shape_K, stride_k));
+      Tensor V = make_tensor(make_gmem_ptr(dcV), make_layout(shape_V, stride_v));
+      Tensor K_cache = make_tensor(make_gmem_ptr(dcK_cache), make_layout(shape_K_cache, stride_k_cache));
+      Tensor V_cache = make_tensor(make_gmem_ptr(dcV_cache), make_layout(shape_V_cache, stride_v_cache));
+      Tensor O = make_tensor(make_gmem_ptr(ptrO), make_layout(shape_O, stride_o));
+
+      // O accumulator types
+      FragA tArA;
+      FragARow tA_max, tA_sum;
+
+      // Main loop
+      int l_coord = is_var_len ? 0 : idx_b;
+      CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
+      mainloop(
+          Q(_, _, head_q, l_coord),
+          K(_, _, head, l_coord),
+          V(_, _, head, l_coord),
+          tArA,
+          tA_max,
+          tA_sum,
+          blk_qv,
+          0,
+          k_blocks,
+          k_blocks,
+          thr_id,
+          seq_len,
+          seq_len_kv_cache,
+          idx_b,
+          full_tile_offset,
+          discard_seq_coord,
+          K_cache(_, _, head, l_coord),
+          V_cache(_, _, head, l_coord));
+
+      if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
+        sycl::group_barrier(get_work_group<3>());
+      }
+
+      // Epilogue
+      CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
+      epilogue(O(_, _, head_q, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id);
+    }
+  }
+};
+
+template <class ProblemShape_, class CollectiveMainloop_, class CollectiveEpilogue_, class TileScheduler_>
+class XeFMHAFwdDynamicSplitKernel {
+ public:
+  //
+  // Type Aliases
+  //
+  using ProblemShape = ProblemShape_;
+
+  // Mainloop derived types
+  using CollectiveMainloop = CollectiveMainloop_;
+  using MainloopArguments = typename CollectiveMainloop::Arguments;
+  using MainloopParams = typename CollectiveMainloop::Params;
+
+  using TiledMMAQK = typename CollectiveMainloop::TiledMMAQK;
+  using TiledMMAPV = typename CollectiveMainloop::TiledMMAPV;
+  using TileShapeQK = typename CollectiveMainloop::TileShapeQK;
+  using TileShapePV = typename CollectiveMainloop::TileShapePV;
+
+  using ElementQ = typename CollectiveMainloop::TensorQ::element_type;
+  using ElementK = typename CollectiveMainloop::TensorK::element_type;
+  using ElementV = typename CollectiveMainloop::TensorV::element_type;
+
+  using StrideQ = decltype(stride(typename CollectiveMainloop::TensorQ{}));
+  using StrideK = decltype(stride(typename CollectiveMainloop::TensorK{}));
+  using StrideV = decltype(stride(typename CollectiveMainloop::TensorV{}));
+
+  using SGPerWG = typename CollectiveMainloop::SGPerWG;
+
+  using FragA = typename CollectiveMainloop::FragA;
+  using SingleFragA = typename CollectiveMainloop::SingleFragA;
+  using FragARow = typename CollectiveMainloop::FragARow;
+  // element dtype for MmaPV results
+  using ElementA = typename CollectiveMainloop::ElementA;
+
+  // Tile scheduler derived types
+  static_assert(is_same_v<TileScheduler_, XeFHMAIndividualPersistentTileScheduler>);
+  using TileScheduler = TileScheduler_;
+  using TileSchedulerParams = typename TileScheduler::Params;
+
+  // Epilogue derived types
+  using CollectiveEpilogue = CollectiveEpilogue_;
+  using EpilogueArguments = typename CollectiveEpilogue::Arguments;
+  using EpilogueParams = typename CollectiveEpilogue::Params;
+
+  using TileShapeO = typename CollectiveEpilogue::TileShapeO;
+  using ElementO = typename CollectiveEpilogue::TensorO::element_type;
+  using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
+
+  // Kernel level shared memory storage
+  using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
+  using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
+  union SharedStorage {
+    MainloopSharedStorage mainloop;
+    EpilogueSharedStorage epilogue;
+  };
+
+  static constexpr int SharedStorageSize = is_empty_v<SharedStorage> ? size_t(0) : sizeof(SharedStorage);
+
+  // Important: make sure multiple of 16 element for each copy
+  // this is for storing partial results from different KV partitions
+  static constexpr int num_elem_per_thread = (size(FragA{}.shape()) + 2 * size(FragARow{}.shape()) + 15) / 16 * 16;
+  static const int max_num_partitions = 8;
+
+  // Device side arguments
+  struct KernelArguments {
+    ProblemShape shape;
+    const ElementQ* Q;
+    StrideQ dQ;
+    const ElementK* K;
+    StrideK dK;
+    const ElementV* V;
+    StrideV dV;
+    ElementO* O;
+    StrideO dO;
+    const ElementK* K_cache = nullptr;
+    StrideK dK_cache{};
+    const ElementV* V_cache = nullptr;
+    StrideV dV_cache{};
+  };
+  using KernelParams = KernelArguments;
+
+  struct Arguments {
+    KernelArguments kernel{};
+    MainloopArguments mainloop{};
+    EpilogueArguments epilogue{};
+    KernelHardwareInfo hw_info{};
+  };
+
+  // Kernel entry point API
+  struct Params {
+    KernelParams kernel;
+    MainloopParams mainloop;
+    EpilogueParams epilogue;
+    TileSchedulerParams scheduler;
+    // workspace for storing partial results of different KV partitions
+    ElementA* partial_results_ptr = nullptr;
+    // for atomic add
+    int32_t* atomic_reduce_cnt_ptr = nullptr;
+  };
+
+  //
+  // Methods
+  //
+
+  static Params to_underlying_arguments(Arguments const& args, void* workspace) {
+    int num_batch_heads = args.kernel.shape.batch * args.kernel.shape.num_heads_q;
+    int32_t* atomic_reduce_cnt_ptr = reinterpret_cast<int32_t*>(workspace);
+    ElementA* partial_results_ptr = reinterpret_cast<ElementA*>(atomic_reduce_cnt_ptr + num_batch_heads);
+    return {
+        args.kernel,
+        CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
+        CollectiveEpilogue::to_underlying_arguments(args.epilogue, workspace),
+        TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{}),
+        partial_results_ptr,
+        atomic_reduce_cnt_ptr};
+  }
+
+  static bool can_implement(Arguments const& args) {
+    // current kernel only support decode
+    if (args.kernel.shape.seq_len_qo > 1) {
+      return false;
+    }
+    // current kernel only support num batch heads less than total XeCore count
+    if (args.kernel.shape.batch * args.kernel.shape.num_heads_q > args.hw_info.sm_count) {
+      return false;
+    }
+    return CollectiveMainloop::can_implement(args.mainloop) && CollectiveEpilogue::can_implement(args.epilogue);
+  }
+
+  static int get_workspace_size(Arguments const& args) {
+    int ws_size = 0;
+    int num_batch_heads = args.kernel.shape.batch * args.kernel.shape.num_heads_q;
+    const int wg_size = SGPerWG::value * intel::sg_size;
+
+    // partial attn outputs, exp sum and max logits
+    ws_size += (max_num_partitions * num_batch_heads) * wg_size * num_elem_per_thread * sizeof(ElementA);
+    // atomic counter
+    ws_size += num_batch_heads * sizeof(int32_t);
+    return ws_size;
+  }
+
+  static cutlass::Status initialize_workspace(
+      Arguments const& args,
+      void* workspace = nullptr,
+      cudaStream_t stream = nullptr,
+      CudaHostAdapter* cuda_adapter = nullptr) {
+    int num_batch_heads = args.kernel.shape.batch * args.kernel.shape.num_heads_q;
+    compat::fill(reinterpret_cast<int32_t*>(workspace), (int32_t)0, num_batch_heads);
+    auto partial_ws_count = (get_workspace_size(args) - num_batch_heads * sizeof(int32_t)) / sizeof(ElementA);
+    auto* partial_results_ptr = reinterpret_cast<ElementA*>(reinterpret_cast<int32_t*>(workspace) + num_batch_heads);
+    compat::fill(partial_results_ptr, (ElementA)0, partial_ws_count);
+    return Status::kSuccess;
+  }
+
+  static dim3 get_grid_shape(Params const& params) {
+    return TileScheduler::template get_grid_shape<SGPerWG::value>(params.scheduler);
+  }
+
+  static dim3 get_block_shape() {
+    return dim3(SGPerWG::value * intel::sg_size, 1, 1);
+  }
+
+  CUTLASS_DEVICE
+  int get_partition_id(
+      const int cur_wg_id, const int batch_head_id, const int num_blocks_per_wg, const int local_k_blocks) {
+    int partition_id = 0;
+    if (batch_head_id == 0) {
+      return cur_wg_id;
+    }
+    int start_wg_id = batch_head_id * local_k_blocks / num_blocks_per_wg;
+    partition_id = cur_wg_id - start_wg_id;
+    return partition_id;
+  }
+
+  CUTLASS_DEVICE
+  int get_num_partitions(const int batch_head_id, const int num_blocks_per_wg, const int local_k_blocks) {
+    int num_partitions = 1;
+    int start_wg_id = batch_head_id * local_k_blocks / num_blocks_per_wg;
+    int end_wg_id = (batch_head_id + 1) * local_k_blocks / num_blocks_per_wg;
+    num_partitions = end_wg_id - start_wg_id + 1;
+    // end_wg_id is the starting wg id of next batch head id
+    if (((batch_head_id + 1) * local_k_blocks) % num_blocks_per_wg == 0) {
+      num_partitions -= 1;
+    }
+    return num_partitions;
+  }
+
+  template <class Params, class FragA, class FragARow>
+  CUTLASS_DEVICE void reduce_split2(
+      const Params& params,
+      FragA& out1,
+      FragARow& max_val1,
+      FragARow& exp_sum_val1,
+      FragA& out2,
+      FragARow& max_val2,
+      FragARow& exp_sum_val2) {
+    // global max value
+    FragARow max_prev1 = max_val1;
+    FragARow max_prev2 = max_val2;
+
+    auto scale = params.mainloop.scale;
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < max_val1.size(); i++) {
+      max_val1(i) = sycl::max(max_val1(i), max_val2(i));
+    }
+
+    FragARow rescale1, rescale2;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < max_val1.size(); i++) {
+      rescale1(i) = sycl::native::exp2(max_prev1(i) - max_val1(i));
+      rescale2(i) = sycl::native::exp2(max_prev2(i) - max_val1(i));
+    }
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < exp_sum_val1.size(); i++) {
+      exp_sum_val1(i) = exp_sum_val1(i) * rescale1(i) + exp_sum_val2(i) * rescale2(i);
+    }
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < out1.size(); i++)
+      out1(i) = out1(i) * broadcast<0>(rescale1, out1, i) + out2(i) * broadcast<0>(rescale2, out2, i);
+  }
+
+  CUTLASS_DEVICE
+  void operator()(Params const& params, char* smem_buf) {
+    using namespace sycl::ext::oneapi::this_work_item;
+
+    SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
+
+    auto& p = params.kernel;
+    ProblemShape const& s = p.shape;
+    int head_group_q = s.num_heads_q / s.num_heads_kv;
+
+    int thr_id = int(ThreadIdxX());
+    int wg_id = int(BlockIdxZ());
+
+    int sg_id = thr_id / intel::sg_size;
+    int tid_in_sg = thr_id % intel::sg_size;
+    int num_batch_heads = s.batch * s.num_heads_q;
+
+    int local_k_blocks = cute::ceil_div(s.seq_len_kv, get<1>(TileShapeQK{}));
+    // total number of blocks need to be processed across all wgs
+    int total_k_blocks = local_k_blocks * num_batch_heads;
+    // to guarantee all wg process similar number of blocks of KV
+    int num_blocks_per_wg = cute::ceil_div(total_k_blocks, GridDimZ());
+
+    TileScheduler tile_scheduler{params.scheduler, get<1>(TileShapeQK{}), local_k_blocks, num_batch_heads};
+
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (; tile_scheduler.is_valid(); ++tile_scheduler) {
+      auto [blk_q, blk_v, start_batch_head_id] = tile_scheduler.get_block_coord();  // (Q,V, batch_head_idx)
+      auto blk_qv = make_coord(blk_q, blk_v);
+
+      auto shape_Q = make_shape(s.seq_len_qo, s.head_size_qk, s.num_heads_q, s.batch);
+      auto shape_K = make_shape(s.seq_len_kv, s.head_size_qk, s.num_heads_kv, s.batch);
+      auto shape_V = make_shape(s.head_size_vo, s.seq_len_kv, s.num_heads_kv, s.batch);
+      auto shape_O = make_shape(s.seq_len_qo, s.head_size_vo, s.num_heads_q, s.batch);
+
+      auto dcQ = const_cast<ElementQ*>(p.Q);  // de-const these for uniformity
+      auto dcK = const_cast<ElementK*>(p.K);
+      auto dcV = const_cast<ElementV*>(p.V);
+
+      Tensor Q = make_tensor(make_gmem_ptr(dcQ), make_layout(shape_Q, p.dQ));  // (q,d,h,b)
+      Tensor K = make_tensor(make_gmem_ptr(dcK), make_layout(shape_K, p.dK));  // (k,d,h,b)
+      Tensor V = make_tensor(make_gmem_ptr(dcV), make_layout(shape_V, p.dV));  // (v,k,h,b)
+      Tensor O = make_tensor(make_gmem_ptr(p.O), make_layout(shape_O, p.dO));  // (q,v,h,b)
+
+      auto shape_K_cache = make_shape(s.seq_len_kv_cache, s.head_size_qk, s.num_heads_kv, s.batch);
+      auto shape_V_cache = make_shape(s.head_size_vo, s.seq_len_kv_cache, s.num_heads_kv, s.batch);
+      auto dcK_cache = const_cast<ElementK*>(p.K_cache);
+      auto dcV_cache = const_cast<ElementV*>(p.V_cache);
+      Tensor K_cache = make_tensor(make_gmem_ptr(dcK_cache), make_layout(shape_K_cache, p.dK_cache));
+      Tensor V_cache = make_tensor(make_gmem_ptr(dcV_cache), make_layout(shape_V_cache, p.dV_cache));
+
+      // O accumulator types
+      FragA tArA;
+      FragARow tA_max, tA_sum;
+
+      // compute num computed blocks for start batch head id
+      int num_computed_blocks = (start_batch_head_id == 0)
+                                    ? (wg_id * num_blocks_per_wg)
+                                    : (wg_id * num_blocks_per_wg - start_batch_head_id * local_k_blocks);
+      int start_blk, end_blk, head_q, idx_b, head_kv;
+      // leader wg is also responsible for reducing partial results, while other
+      // worker wg only to compute partial results
+      bool is_leader_wg = wg_id < num_batch_heads;
+
+      if (thr_id == 0 && is_leader_wg) {
+        // reset atomic counter before computation
+        *(params.atomic_reduce_cnt_ptr + wg_id) = 0;
+      }
+
+      // Main loop
+      CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
+
+      // compute blocks budget remained for each wg
+      int block_budget_remained = num_blocks_per_wg;
+      int batch_head_id = start_batch_head_id;
+      bool is_update_batch_head_id = false;
+      while (block_budget_remained > 0) {
+        int num_new_blocks = local_k_blocks - num_computed_blocks;
+        if (num_new_blocks <= block_budget_remained) {
+          // finished current batch head id
+          start_blk = num_computed_blocks;
+          end_blk = start_blk + num_new_blocks;
+
+          // update states
+          num_computed_blocks = 0;
+          block_budget_remained -= num_new_blocks;
+          is_update_batch_head_id = true;
+        } else {
+          // budget cannot afford finishing current batch head id
+          start_blk = num_computed_blocks;
+          end_blk = start_blk + block_budget_remained;
+
+          block_budget_remained = 0;
+          is_update_batch_head_id = false;
+        }
+
+        head_q = batch_head_id % s.num_heads_q;
+        idx_b = batch_head_id / s.num_heads_q;
+        head_kv = head_q / head_group_q;
+        // mainloop
+        mainloop(
+            Q(_, _, head_q, idx_b),
+            K(_, _, head_kv, idx_b),
+            V(_, _, head_kv, idx_b),
+            tArA,
+            tA_max,
+            tA_sum,
+            blk_qv,
+            start_blk,
+            end_blk,
+            local_k_blocks,
+            thr_id,
+            s.seq_len_kv,
+            0,
+            0,
+            0,
+            0);
+
+        // partition id of start batch head id in current wg
+        int partition_id = get_partition_id(wg_id, batch_head_id, num_blocks_per_wg, local_k_blocks);
+
+        // store partial result: tArA, tA_max and tA_sum
+        int offset = batch_head_id * max_num_partitions * num_elem_per_thread * SGPerWG::value * intel::sg_size +
+                     partition_id * num_elem_per_thread * SGPerWG::value * intel::sg_size +
+                     sg_id * intel::sg_size * num_elem_per_thread + tid_in_sg * num_elem_per_thread;
+        Tensor tPartial = make_tensor(params.partial_results_ptr + offset, make_shape(Int<num_elem_per_thread>{}));
+        Tensor merged_res = make_tensor<ElementA>(Int<num_elem_per_thread>{});
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(FragA{}.shape()); ++i) {
+          merged_res(i) = tArA(i);
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(FragARow{}.shape()); ++i) {
+          merged_res(2 * i + size(FragA{}.shape())) = tA_max(i);
+          merged_res(2 * i + 1 + size(FragA{}.shape())) = tA_sum(i);
+        }
+        copy(merged_res, tPartial);
+
+        // after store, set atomic cnt
+        if (thr_id == 0) {
+          atomicAdd(params.atomic_reduce_cnt_ptr + batch_head_id, 1);
+        }
+
+        // advance to next batch head id
+        if (is_update_batch_head_id) {
+          batch_head_id += 1;
+          if (batch_head_id >= num_batch_heads) {
+            break;
+          }
+        }
+      }
+
+      if (is_leader_wg) {
+        int num_partitions = get_num_partitions(wg_id, num_blocks_per_wg, local_k_blocks);
+
+        // check atomic to wait for partial results ready
+        while (atomicLoad(params.atomic_reduce_cnt_ptr + wg_id) != num_partitions) {
+        }
+
+        clear(tArA);
+        clear(tA_max);
+        clear(tA_sum);
+
+        for (int i = 0; i < num_partitions; ++i) {
+          int offset = wg_id * max_num_partitions * SGPerWG::value * intel::sg_size * num_elem_per_thread +
+                       i * SGPerWG::value * intel::sg_size * num_elem_per_thread +
+                       sg_id * intel::sg_size * num_elem_per_thread + tid_in_sg * num_elem_per_thread;
+          Tensor tPartial = make_tensor(params.partial_results_ptr + offset, make_shape(Int<num_elem_per_thread>{}));
+          Tensor merged_res = make_tensor<ElementA>(Int<num_elem_per_thread>{});
+          copy(tPartial, merged_res);
+
+          if (i == 0) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < size(FragA{}.shape()); ++i) {
+              tArA(i) = merged_res(i);
+            }
+
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < size(FragARow{}.shape()); ++i) {
+              tA_max(i) = merged_res(2 * i + size(FragA{}.shape()));
+              tA_sum(i) = merged_res(2 * i + 1 + size(FragA{}.shape()));
+            }
+
+            continue;
+          }
+
+          FragA tArA_2;
+          FragARow tA_max_2, tA_sum_2;
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < size(FragA{}.shape()); ++i) {
+            tArA_2(i) = merged_res(i);
+          }
+
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < size(FragARow{}.shape()); ++i) {
+            tA_max_2(i) = merged_res(2 * i + size(FragA{}.shape()));
+            tA_sum_2(i) = merged_res(2 * i + 1 + size(FragA{}.shape()));
+          }
+
+          reduce_split2(params, tArA, tA_max, tA_sum, tArA_2, tA_max_2, tA_sum_2);
+        }
+
+        // require group barrier if using SLM
+        if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
+          sycl::group_barrier(get_work_group<3>());
+        }
+
+        head_q = wg_id % s.num_heads_q;
+        idx_b = wg_id / s.num_heads_q;
+        head_kv = head_q / head_group_q;
+
+        // Epilogue
+        CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
+        epilogue(O(_, _, head_q, idx_b), tArA, tA_max, tA_sum, blk_qv, thr_id);
+      }
+    }
+  }
+};
+
+}  // namespace cutlass::fmha::chunk_prefill
+// ChunkPrefill tile schedulers – merged from chunk_prefill/xe_tile_scheduler.hpp
+
+namespace cutlass::fmha::chunk_prefill {
+
+struct XeFHMAIndividualTileScheduler {
+  struct Params {
+    dim3 grid;
+    FastDivmod divmod_num_heads;
+  };
+
+  bool valid_ = true;
+  Params params;
+
+  CUTLASS_DEVICE
+  XeFHMAIndividualTileScheduler(Params const& params) : params(params) {}
+
+  template <class ProblemShape, class TileShape>
+  static Params
+  to_underlying_arguments(ProblemShape const& shape, KernelHardwareInfo hw_info, TileShape const& tile_shape) {
+    using namespace cute;
+
+    dim3 grid(
+        size(ceil_div(shape.head_size_vo, get<1>(tile_shape))),  // V
+        size(ceil_div(shape.seq_len_qo, get<0>(tile_shape))),    // Q
+        size(shape.batch * shape.num_heads_q));                  // (h,b) -- split later
+    return Params{grid, {shape.num_heads_q}};
+  }
+
+  template <int Num_SGs>
+  static dim3 get_grid_shape(Params const& params) {
+    return params.grid;
+  }
+
+  CUTLASS_DEVICE
+  bool is_valid() {
+    return valid_;
+  }
+
+  CUTLASS_DEVICE
+  auto get_block_coord() {
+    using namespace cute;
+    int idx_b = BlockIdxZ();
+    int head;
+    params.divmod_num_heads(idx_b, head, idx_b);
+    return make_coord(BlockIdxY(), BlockIdxX(), head, idx_b);
+  }
+
+  CUTLASS_DEVICE
+  XeFHMAIndividualTileScheduler& operator++() {
+    valid_ = false;
+    return *this;
+  }
+};
+
+struct XeFMHAChunkPrefillPersistentTileScheduler {
+  struct Params {
+    int num_tasks = 0;
+    int num_persistent_wgs = 0;
+    int const* prefill_offsets = nullptr;
+    int const* decode_offsets = nullptr;
+    int batch = 0;
+    int num_heads_q = 0;
+    int prefill_tasks_per_v = 0;
+    int tasks_per_v = 0;
+  };
+
+  bool valid_ = true;
+  Params params;
+  int task_idx_ = 0;
+
+  CUTLASS_DEVICE
+  XeFMHAChunkPrefillPersistentTileScheduler(Params const& params)
+      : valid_(BlockIdxX() < params.num_tasks), params(params), task_idx_(BlockIdxX()) {}
+
+  template <class ProblemShape, class TileShape>
+  static Params
+  to_underlying_arguments(ProblemShape const& shape, KernelHardwareInfo hw_info, TileShape const& tile_shape) {
+    constexpr int PersistentWaves = 8;
+    int num_persistent_wgs = cute::min(shape.scheduler_num_tasks, hw_info.sm_count * PersistentWaves);
+    return Params{
+        shape.scheduler_num_tasks,
+        num_persistent_wgs,
+        shape.scheduler_prefill_offsets,
+        shape.scheduler_decode_offsets,
+        shape.batch,
+        shape.num_heads_q,
+        shape.scheduler_prefill_tasks_per_v,
+        shape.scheduler_tasks_per_v};
+  }
+
+  template <int Num_SGs>
+  static dim3 get_grid_shape(Params const& params) {
+    return dim3(params.num_persistent_wgs, 1, 1);
+  }
+
+  CUTLASS_DEVICE
+  bool is_valid() {
+    return valid_;
+  }
+
+  CUTLASS_DEVICE
+  int find_batch(int const* offsets, int value) const {
+    int lower = 0;
+    int upper = params.batch;
+    while (lower + 1 < upper) {
+      int middle = (lower + upper) / 2;
+      if (offsets[middle] <= value) {
+        lower = middle;
+      } else {
+        upper = middle;
+      }
+    }
+    return lower;
+  }
+
+  CUTLASS_DEVICE
+  auto get_block_coord() {
+    using namespace cute;
+    int blk_v = task_idx_ / params.tasks_per_v;
+    int task_in_v = task_idx_ - blk_v * params.tasks_per_v;
+    if (task_in_v < params.prefill_tasks_per_v) {
+      int idx_b = find_batch(params.prefill_offsets, task_in_v);
+      int local_task = task_in_v - params.prefill_offsets[idx_b];
+      int batch_tasks = params.prefill_offsets[idx_b + 1] - params.prefill_offsets[idx_b];
+      int num_q_blocks = batch_tasks / params.num_heads_q;
+      int head = local_task / num_q_blocks;
+      int blk_q = local_task - head * num_q_blocks;
+      return make_coord(blk_q, blk_v, head, idx_b);
+    }
+
+    int decode_batch_head = task_in_v - params.prefill_tasks_per_v;
+    int idx_b = find_batch(params.decode_offsets, decode_batch_head);
+    int head = decode_batch_head - params.decode_offsets[idx_b];
+    return make_coord(0, blk_v, head, idx_b);
+  }
+
+  CUTLASS_DEVICE
+  XeFMHAChunkPrefillPersistentTileScheduler& operator++() {
+    task_idx_ += GridDimX();
+    valid_ = task_idx_ < params.num_tasks;
+    return *this;
+  }
+};
+
+struct XeFHMAIndividualPersistentTileScheduler {
+  struct Params {
+    dim3 grid;
+    FastDivmod divmod_num_heads;
+  };
+
+  bool valid_ = true;
+  Params params;
+  int kv_tile_size_;
+  // num of kv blocks for each head
+  int local_num_kv_blocks_;
+  int num_batch_heads_;
+
+  CUTLASS_DEVICE
+  XeFHMAIndividualPersistentTileScheduler(
+      Params const& params, int kv_tile_size, int local_num_kv_blocks, int num_batch_heads)
+      : params(params),
+        kv_tile_size_(kv_tile_size),
+        local_num_kv_blocks_(local_num_kv_blocks),
+        num_batch_heads_(num_batch_heads) {}
+
+  template <class ProblemShape, class TileShape>
+  static Params
+  to_underlying_arguments(ProblemShape const& shape, KernelHardwareInfo hw_info, TileShape const& tile_shape) {
+    using namespace cute;
+
+    dim3 grid(
+        size(ceil_div(shape.head_size_vo, get<1>(tile_shape))),  // V
+        size(ceil_div(shape.seq_len_qo, get<0>(tile_shape))),    // Q
+        size(shape.batch * shape.num_heads_q));                  // (h,b) -- split later
+    int num_heads = shape.num_heads_q;
+    grid.z = hw_info.sm_count;
+
+    return Params{grid, {num_heads}};
+  }
+
+  template <int Num_SGs>
+  static dim3 get_grid_shape(Params const& params) {
+    return params.grid;
+  }
+
+  CUTLASS_DEVICE
+  bool is_valid() {
+    return valid_;
+  }
+
+  CUTLASS_DEVICE
+  auto get_block_coord() {
+    using namespace cute;
+    int wg_id = BlockIdxZ();
+
+    // total number of blocks need to be processed across all wgs
+    int total_num_kv_blocks = local_num_kv_blocks_ * num_batch_heads_;
+    // guarantee all wg process similar number of blocks of KV (load balance)
+    int num_blocks_per_wg = cute::ceil_div(total_num_kv_blocks, GridDimZ());
+
+    // compute start batch head id for current wg
+    int start_batch_head_id = wg_id * num_blocks_per_wg / local_num_kv_blocks_;
+
+    return make_coord(BlockIdxY(), BlockIdxX(), start_batch_head_id);
+  }
+
+  CUTLASS_DEVICE
+  XeFHMAIndividualPersistentTileScheduler& operator++() {
+    valid_ = false;
+    return *this;
+  }
+};
+
+}  // namespace cutlass::fmha::chunk_prefill
 
 namespace chunkprefill {
 struct Flash_fwd_params {
